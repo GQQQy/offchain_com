@@ -66,6 +66,7 @@ func TestTransitionProof(t *testing.T) {
 	vm2 := core.NewVM(code, 100000)
 	err = p.Verify(vm2.State)
 	assert.NoError(t, err)
+	assert.NotZero(t, p.TraceRoot)
 }
 
 // 测试：Gas计算一致性
@@ -106,7 +107,7 @@ func TestMemoryExpansion(t *testing.T) {
 	// 内存扩展：从0到96字节（3 words），成本 = 3*3 + (9-0) = 9 + 9 = 18?
 	// 实际公式：(words^2)/512 + 3*words = (3^2)/512 + 9 = 0 + 9 = 9
 	// 加上基础MSTORE 3 = 12，加上两个PUSH 6 = 18
-	assert.True(t, vm.State.Gas < 100000-18)
+	assert.Equal(t, uint64(18), 100000-vm.State.Gas)
 }
 
 // 测试：快照序列连续性
@@ -125,7 +126,8 @@ func TestSnapshotSequence(t *testing.T) {
 	vm.RunSteps(2)
 	snap1 := core.NewStandardSnapshot(vm.State, 1337)
 	proof1, _ := proof.GenerateTransitionProof(core.NewVM(code, 100000), 2)
-	seq.AddSnapshot(snap1, proof1)
+	link := proof1.Link()
+	seq.AddSnapshot(snap1, &link)
 
 	// 验证序列
 	assert.Equal(t, 2, len(seq.Snapshots))

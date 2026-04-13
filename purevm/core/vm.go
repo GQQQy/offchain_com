@@ -11,6 +11,8 @@ type VM struct {
 	State          *VMState
 	GasCalc        *GasCalculator
 	InstructionSet map[OpCode]Instruction
+	ChainID        uint64
+	Snapshots      map[common.Hash]*StandardSnapshot
 
 	// 执行控制
 	Halted bool
@@ -40,6 +42,7 @@ func NewVM(code []byte, gasLimit uint64) *VM {
 		State:          NewState(code, gasLimit),
 		GasCalc:        NewGasCalculator(),
 		InstructionSet: InstructionSet,
+		Snapshots:      make(map[common.Hash]*StandardSnapshot),
 		Halted:         false,
 		Tracer:         &ExecutionTracer{Steps: make([]TraceStep, 0)},
 	}
@@ -56,6 +59,7 @@ func (vm *VM) Step() error {
 		return nil
 	}
 
+	prePC := vm.State.PC
 	op := OpCode(vm.State.Code[vm.State.PC])
 
 	// 计算Gas
@@ -69,9 +73,6 @@ func (vm *VM) Step() error {
 		vm.Err = fmt.Errorf("out of gas: have %d, need %d", vm.State.Gas, gasCost)
 		return vm.Err
 	}
-
-	// 记录执行前Gas
-	gasBefore := vm.State.Gas
 
 	// 执行指令
 	if op.IsPush() {
@@ -94,17 +95,28 @@ func (vm *VM) Step() error {
 		return err
 	}
 
-	// 扣除Gas（除非是JUMP类已修改PC的指令）
-	if op != JUMP && op != JUMPI {
+	switch op {
+	case STOP, RESTORE:
+		// STOP/RESTORE 保留指令实现设置的PC。
+	case JUMP:
+		// JUMP已在指令实现中设置目标PC。
+	case JUMPI:
+		if vm.State.PC == prePC {
+			vm.State.PC++
+		}
+	default:
 		vm.State.PC++
 	}
 	vm.State.Gas -= gasCost
 	vm.State.StepCount++
+	if vm.State.PC >= uint64(len(vm.State.Code)) {
+		vm.Halted = true
+	}
 
 	// 记录轨迹
 	if vm.Tracer != nil {
 		vm.Tracer.Steps = append(vm.Tracer.Steps, TraceStep{
-			PC:        vm.State.PC - 1,
+			PC:        prePC,
 			Op:        op.String(),
 			GasCost:   gasCost,
 			GasLeft:   vm.State.Gas,
@@ -144,9 +156,9 @@ func (vm *VM) GetTrace() []TraceStep {
 	return vm.Tracer.Steps
 }
 
-// CreateSnapshot 创建当前状态的标准快照
-func (vm *VM) CreateSnapshot(header SnapshotHeader) *StandardSnapshot {
-	return NewStandardSnapshot(vm.State.Clone(), header)
+// CreateSnapshot 创建当前状态的标准快照。
+func (vm *VM) CreateSnapshot(chainID uint64) *StandardSnapshot {
+	return NewStandardSnapshot(vm.State.Clone(), chainID)
 }
 
 // LoadSnapshot 从快照恢复（用于链上验证）

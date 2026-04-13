@@ -4,12 +4,12 @@ pragma solidity ^0.8.19;
 /**
  * @title PureVM Snapshot Registry
  * @notice 用于链上验证PureVM执行快照的注册表合约
- * @dev 配合预编译合约0x0d0d使用
+ * @dev 配合预编译合约0x0d使用
  */
 contract SnapshotRegistry {
     
     // 预编译合约地址（在部署时初始化）
-    address public constant VALIDATOR = address(0x0000000000000000000000000000000000000d0d);
+    address public constant VALIDATOR = address(0x000000000000000000000000000000000000000d);
     
     struct Checkpoint {
         bytes32 stateRoot;
@@ -62,7 +62,7 @@ contract SnapshotRegistry {
      * @param toStep 目标步骤
      * @param proofData 转移证明（JSON序列化）
      * @param expectedFinalRoot 期望的最终状态根
-     * @param traceRoot 执行轨迹的Merkle根（可选验证）
+     * @param traceRoot 执行轨迹的Merkle根（保留参数，便于链上额外约束）
      */
     function submitTransitionProof(
         uint64 fromStep,
@@ -77,13 +77,12 @@ contract SnapshotRegistry {
         
         uint64 steps = toStep - fromStep;
         
-        // 构造预编译合约输入
+        // 构造预编译合约输入:
+        // [state_len:4][proof_len:4][initial_state_json][proof_json]
         bytes memory input = abi.encodePacked(
-            steps,
-            start.stateRoot,
-            expectedFinalRoot,
-            keccak256(start.stateData), // codeHash，应从状态中正确提取
-            traceRoot,
+            uint32(start.stateData.length),
+            uint32(proofData.length),
+            start.stateData,
             proofData
         );
         

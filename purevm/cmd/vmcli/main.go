@@ -113,7 +113,11 @@ func generateProof(codeHex string, gasLimit, steps uint64, filename string) {
 	data, _ := json.MarshalIndent(p, "", "  ")
 
 	if filename == "" {
-		filename = fmt.Sprintf("proof_%d_steps.json", steps)
+		if steps == 0 {
+			filename = fmt.Sprintf("proof_%d_steps.json", len(p.Steps))
+		} else {
+			filename = fmt.Sprintf("proof_%d_steps.json", steps)
+		}
 	}
 
 	if err := ioutil.WriteFile(filename, data, 0644); err != nil {
