@@ -2,10 +2,8 @@ package main
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"purevm/core"
 	"purevm/proof"
@@ -14,12 +12,15 @@ import (
 
 func main() {
 	var (
-		cmd       = flag.String("cmd", "run", "Command: run|snapshot|prove|verify")
+		cmd       = flag.String("cmd", "run", "Command: run|snapshot|prove|verify|verify-index")
 		codeHex   = flag.String("code", "", "Bytecode hex (e.g. 6005600301)")
 		gas       = flag.Uint64("gas", 100000, "Gas limit")
 		steps     = flag.Uint64("steps", 0, "Steps to execute (0=all)")
 		snapFile  = flag.String("snap", "", "Snapshot file path")
 		proofFile = flag.String("proof", "", "Proof file path")
+		indexFile = flag.String("index", "", "Snapshot index file path")
+		ordinal   = flag.Int("ordinal", 0, "Snapshot ordinal in index")
+		full      = flag.Bool("full", false, "Verify the full adjacent interval when using verify-index")
 		chainID   = flag.Uint64("chainid", 1337, "Chain ID for snapshot")
 	)
 	flag.Parse()
@@ -33,6 +34,8 @@ func main() {
 		generateProof(*codeHex, *gas, *steps, *proofFile)
 	case "verify":
 		verifyProof(*snapFile, *proofFile)
+	case "verify-index":
+		verifyIndex(*indexFile, *ordinal, *steps, *full)
 	default:
 		fmt.Printf("Unknown command: %s\n", *cmd)
 		os.Exit(1)
@@ -84,13 +87,12 @@ func createSnapshot(codeHex string, gasLimit, steps uint64, filename string, cha
 	}
 
 	snap := core.NewStandardSnapshot(vm.State, chainID)
-	data, _ := json.MarshalIndent(snap, "", "  ")
 
 	if filename == "" {
 		filename = fmt.Sprintf("snapshot_step%d.json", snap.Header.StepNumber)
 	}
 
-	if err := ioutil.WriteFile(filename, data, 0644); err != nil {
+	if err := snap.WriteFile(filename); err != nil {
 		fmt.Printf("Failed to write snapshot: %v\n", err)
 		os.Exit(1)
 	}
@@ -110,8 +112,6 @@ func generateProof(codeHex string, gasLimit, steps uint64, filename string) {
 		os.Exit(1)
 	}
 
-	data, _ := json.MarshalIndent(p, "", "  ")
-
 	if filename == "" {
 		if steps == 0 {
 			filename = fmt.Sprintf("proof_%d_steps.json", len(p.Steps))
@@ -120,7 +120,7 @@ func generateProof(codeHex string, gasLimit, steps uint64, filename string) {
 		}
 	}
 
-	if err := ioutil.WriteFile(filename, data, 0644); err != nil {
+	if err := p.WriteFile(filename); err != nil {
 		fmt.Printf("Failed to write proof: %v\n", err)
 		os.Exit(1)
 	}
@@ -134,28 +134,16 @@ func generateProof(codeHex string, gasLimit, steps uint64, filename string) {
 
 func verifyProof(snapFile, proofFile string) {
 	// 加载快照
-	snapData, err := ioutil.ReadFile(snapFile)
+	snap, err := core.ReadSnapshotFile(snapFile)
 	if err != nil {
-		fmt.Printf("Failed to read snapshot: %v\n", err)
-		os.Exit(1)
-	}
-
-	snap, err := core.DeserializeSnapshot(snapData)
-	if err != nil {
-		fmt.Printf("Failed to parse snapshot: %v\n", err)
+		fmt.Printf("Failed to load snapshot: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 加载证明
-	proofData, err := ioutil.ReadFile(proofFile)
+	p, err := proof.ReadTransitionProofFile(proofFile)
 	if err != nil {
-		fmt.Printf("Failed to read proof: %v\n", err)
-		os.Exit(1)
-	}
-
-	var p proof.TransitionProof
-	if err := json.Unmarshal(proofData, &p); err != nil {
-		fmt.Printf("Failed to parse proof: %v\n", err)
+		fmt.Printf("Failed to load proof: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -169,6 +157,64 @@ func verifyProof(snapFile, proofFile string) {
 
 	fmt.Printf("Verification PASSED in %v\n", elapsed)
 	fmt.Printf("Replayed %d steps successfully\n", len(p.Steps))
+}
+
+func verifyIndex(indexFile string, ordinal int, proofSteps uint64, full bool) {
+	idx, err := core.ReadSnapshotIndexFile(indexFile)
+	if err != nil {
+		fmt.Printf("Failed to load snapshot index: %v\n", err)
+		os.Exit(1)
+	}
+
+	startEntry, endEntry, err := idx.AdjacentEntries(ordinal)
+	if err != nil {
+		fmt.Printf("Failed to resolve adjacent snapshots: %v\n", err)
+		os.Exit(1)
+	}
+	if err := idx.ValidateAdjacentThreshold(startEntry, endEntry); err != nil {
+		fmt.Printf("Snapshot threshold validation FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	startSnap, err := core.ReadSnapshotFile(idx.ResolvePath(indexFile, startEntry.SnapshotFile))
+	if err != nil {
+		fmt.Printf("Failed to load start snapshot: %v\n", err)
+		os.Exit(1)
+	}
+	endSnap, err := core.ReadSnapshotFile(idx.ResolvePath(indexFile, endEntry.SnapshotFile))
+	if err != nil {
+		fmt.Printf("Failed to load end snapshot: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !full && proofSteps == 0 && startEntry.AdjacentProofSteps > 0 {
+		proofSteps = startEntry.AdjacentProofSteps
+	}
+	if full {
+		proofSteps = 0
+	}
+
+	start := time.Now()
+	p, err := proof.VerifyAdjacentSnapshots(startSnap, endSnap, proofSteps)
+	if err != nil {
+		fmt.Printf("Index verification FAILED: %v\n", err)
+		os.Exit(1)
+	}
+	elapsed := time.Since(start)
+
+	fmt.Printf("Index verification PASSED in %v\n", elapsed)
+	fmt.Printf("Start ordinal: %d\n", startEntry.Ordinal)
+	fmt.Printf("End ordinal:   %d\n", endEntry.Ordinal)
+	fmt.Printf("Start step:    %d\n", startEntry.StepNumber)
+	fmt.Printf("End step:      %d\n", endEntry.StepNumber)
+	fmt.Printf("Verified steps:%d\n", len(p.Steps))
+	fmt.Printf("Initial root:  %s\n", p.InitialHash.Hex())
+	fmt.Printf("Final root:    %s\n", p.FinalHash.Hex())
+	if proofSteps == 0 || proofSteps == endEntry.StepNumber-startEntry.StepNumber {
+		fmt.Printf("Mode:          full adjacent interval\n")
+	} else {
+		fmt.Printf("Mode:          windowed adjacent verification\n")
+	}
 }
 
 func parseHex(s string) []byte {

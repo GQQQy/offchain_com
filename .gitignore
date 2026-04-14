@@ -1,0 +1,41 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.tmp
+*.log
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Root local artifacts
+.tmp/
+.cache/
+
+# Go build / module caches
+purevm/.gocache/
+purevm/.gomodcache/
+purevm/.gopath/
+
+# Go binaries / test binaries
+purevm/*.exe
+purevm/*.test
+purevm/vmcli
+purevm/vmcli.exe
+
+# Generated long-run artifacts
+purevm/test/testdata/long_run_artifacts/
+
+# Foundry / Solidity build outputs
+VerCom/cache/
+VerCom/out/
+VerCom/broadcast/
+VerCom/.svm/
+VerCom/.tmp/
+
+# Solidity docs
+VerCom/docs/

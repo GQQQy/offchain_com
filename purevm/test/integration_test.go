@@ -2,6 +2,8 @@ package test
 
 import (
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"testing"
 
 	"purevm/core"
@@ -133,4 +135,93 @@ func TestSnapshotSequence(t *testing.T) {
 	assert.Equal(t, 2, len(seq.Snapshots))
 	assert.Equal(t, uint64(0), seq.Snapshots[0].Header.StepNumber)
 	assert.Equal(t, uint64(2), seq.Snapshots[1].Header.StepNumber)
+}
+
+func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
+	const (
+		chainID        = 1337
+		thresholdGas   = uint64(500)
+		targetTotalGas = uint64(2500)
+	)
+
+	task := buildGasWeightedTaskForThreshold(targetTotalGas, thresholdGas)
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "snapshot_index.json")
+
+	vm := core.NewVM(task.Code, task.TotalGas)
+	vm.ChainID = chainID
+
+	index := core.NewSnapshotIndex(chainID, task.TotalGas, thresholdGas)
+	index.BytecodeHex = task.BytecodeHex
+
+	initialPath := filepath.Join(dir, "snapshot_000_initial.json")
+	initialSnap := core.NewStandardSnapshot(vm.State, chainID)
+	assert.NoError(t, initialSnap.WriteFile(initialPath))
+	index.AddSnapshot(filepath.Base(initialPath), initialSnap, 0)
+
+	snapPaths := []string{initialPath}
+	nextThreshold := thresholdGas
+	for !vm.Halted {
+		err := vm.Step()
+		assert.NoError(t, err)
+
+		gasUsed := task.TotalGas - vm.State.Gas
+		for gasUsed >= nextThreshold && nextThreshold <= task.TotalGas {
+			path := filepath.Join(dir, fmt.Sprintf("snapshot_%03d.json", len(snapPaths)))
+			snap := saveSnapshotAtGas(t, vm, gasUsed, nextThreshold, path)
+			snapPaths = append(snapPaths, path)
+			index.AddSnapshot(filepath.Base(path), snap, gasUsed)
+			nextThreshold += thresholdGas
+		}
+	}
+
+	finalPath := filepath.Join(dir, "snapshot_final.json")
+	finalSnap := saveSnapshotAtGas(t, vm, task.TotalGas-vm.State.Gas, 0, finalPath)
+	snapPaths = append(snapPaths, finalPath)
+	index.AddSnapshot(filepath.Base(finalPath), finalSnap, task.TotalGas-vm.State.Gas)
+
+	for ordinal := 0; ordinal < len(index.Snapshots)-1; ordinal++ {
+		startEntry, endEntry, err := index.AdjacentEntries(ordinal)
+		assert.NoError(t, err)
+
+		startSnap, err := core.ReadSnapshotFile(index.ResolvePath(indexPath, startEntry.SnapshotFile))
+		assert.NoError(t, err)
+		endSnap, err := core.ReadSnapshotFile(index.ResolvePath(indexPath, endEntry.SnapshotFile))
+		assert.NoError(t, err)
+
+		p, err := proof.VerifyAdjacentSnapshots(startSnap, endSnap, 0)
+		assert.NoError(t, err)
+		assert.Equal(t, endSnap.Header.StateRoot, p.FinalHash)
+
+		proofPath := filepath.Join(dir, fmt.Sprintf("proof_%03d.json", ordinal))
+		assert.NoError(t, p.WriteFile(proofPath))
+		assert.NoError(t, index.SetAdjacentProof(ordinal, filepath.Base(proofPath), uint64(len(p.Steps)), true))
+	}
+
+	assert.NoError(t, index.WriteFile(indexPath))
+
+	selectedOrdinal := len(index.Snapshots) / 2
+	p, err := verifySnapshotIndexPair(indexPath, selectedOrdinal, 0, true)
+	assert.NoError(t, err)
+	assert.NotNil(t, p)
+}
+
+func TestSnapshotIndexThresholdValidation(t *testing.T) {
+	idx := core.NewSnapshotIndex(1337, 3000, 500)
+	idx.Snapshots = []core.SnapshotIndexEntry{
+		{Ordinal: 0, StepNumber: 0, GasUsed: 0},
+		{Ordinal: 1, StepNumber: 10, GasUsed: 501},
+		{Ordinal: 2, StepNumber: 20, GasUsed: 1004},
+	}
+
+	err := idx.ValidateAdjacentThreshold(&idx.Snapshots[0], &idx.Snapshots[1])
+	assert.NoError(t, err)
+
+	err = idx.ValidateAdjacentThreshold(&idx.Snapshots[1], &idx.Snapshots[2])
+	assert.NoError(t, err)
+
+	bad := idx.Snapshots[1]
+	bad.GasUsed = 499
+	err = idx.ValidateAdjacentThreshold(&idx.Snapshots[0], &bad)
+	assert.Error(t, err)
 }
