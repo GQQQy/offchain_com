@@ -1,8 +1,0 @@
-./gas_table.go
-./instructions.go
-./snapshot.go
-./snapshot_file.go
-./snapshot_index.go
-./state.go
-./types.go
-./vm.go

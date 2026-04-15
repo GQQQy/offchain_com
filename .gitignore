@@ -15,27 +15,28 @@ Desktop.ini
 # Root local artifacts
 .tmp/
 .cache/
+**/.tmp/
+**/.cache/
 
 # Go build / module caches
-purevm/.gocache/
-purevm/.gomodcache/
-purevm/.gopath/
+**/.gocache/
+**/.gomodcache/
+**/.gopath/
 
 # Go binaries / test binaries
-purevm/*.exe
-purevm/*.test
-purevm/vmcli
-purevm/vmcli.exe
+**/*.test
+**/vmcli
+**/vmcli.exe
+**/*.exe
 
 # Generated long-run artifacts
-purevm/test/testdata/long_run_artifacts/
+**/testdata/long_run_artifacts/
 
 # Foundry / Solidity build outputs
-VerCom/cache/
-VerCom/out/
-VerCom/broadcast/
-VerCom/.svm/
-VerCom/.tmp/
+**/cache/
+**/out/
+**/broadcast/
+**/.svm/
 
 # Solidity docs
-VerCom/docs/
+**/docs/
