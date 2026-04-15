@@ -104,8 +104,8 @@ func (idx *SnapshotIndex) AdjacentEntries(ordinal int) (*SnapshotIndexEntry, *Sn
 	return current, next, nil
 }
 
-// ValidateAdjacentThreshold 检查相邻快照是否满足快照阈值划分规则。
-// 对于非最终快照，要求 end 快照的 gasUsed 至少跨过 start 之后的下一档阈值。
+// ValidateAdjacentThreshold 检查相邻快照是否满足“单段执行权重不超过阈值”的基础约束。
+// 更严格的“下一步会越阈值所以在这里切快照”由重放时的快照 hash 比较来保证。
 func (idx *SnapshotIndex) ValidateAdjacentThreshold(start, end *SnapshotIndexEntry) error {
 	if idx.SnapshotThresholdGas == 0 {
 		return nil
@@ -117,24 +117,12 @@ func (idx *SnapshotIndex) ValidateAdjacentThreshold(start, end *SnapshotIndexEnt
 		return fmt.Errorf("non-increasing step number: start=%d end=%d", start.StepNumber, end.StepNumber)
 	}
 
-	// 最后一个快照允许只是任务收尾，不一定对应新的阈值跨越。
-	if end.Ordinal == len(idx.Snapshots)-1 {
-		return nil
-	}
-
-	expectedBoundary := ((start.GasUsed / idx.SnapshotThresholdGas) + 1) * idx.SnapshotThresholdGas
-	if start.GasUsed >= expectedBoundary {
+	segmentGasUsed := end.GasUsed - start.GasUsed
+	if segmentGasUsed > idx.SnapshotThresholdGas {
 		return fmt.Errorf(
-			"start snapshot already beyond expected boundary: gasUsed=%d boundary=%d",
-			start.GasUsed,
-			expectedBoundary,
-		)
-	}
-	if end.GasUsed < expectedBoundary {
-		return fmt.Errorf(
-			"end snapshot did not cross threshold boundary: gasUsed=%d boundary=%d",
-			end.GasUsed,
-			expectedBoundary,
+			"adjacent snapshot segment exceeds threshold: segment=%d threshold=%d",
+			segmentGasUsed,
+			idx.SnapshotThresholdGas,
 		)
 	}
 

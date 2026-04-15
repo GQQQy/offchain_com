@@ -33,6 +33,7 @@ func TestFileBackedSnapshotsLongRun(t *testing.T) {
 		t.Skip("set PUREVM_GAS_SCALE_TEST=1 to run the gas-weighted snapshot test")
 	}
 
+	// 这条测试模拟一个“总 Gas = 5 * 参考块 Gas，上报阈值 = 1/5 * 参考块 Gas”的完整任务。
 	task := buildGasWeightedTask()
 	artifactDir := artifactDir(t)
 	writeTaskArtifacts(t, artifactDir, task)
@@ -59,24 +60,29 @@ func TestFileBackedSnapshotsLongRun(t *testing.T) {
 
 	snapshotPaths := []string{initialPath}
 	snapshotGasUsed := []uint64{0}
-	nextThreshold := snapshotThresholdGas
+	windowGasUsed := uint64(0)
 
+	// 预判下一步若会越过阈值，则先保存当前快照，再开始下一段累计。
 	start := time.Now()
 	for !vm.Halted {
-		require.NoError(t, vm.Step())
+		nextGas, err := vm.PeekNextGasCost()
+		require.NoError(t, err)
 
 		gasUsed := task.TotalGas - vm.State.Gas
-		for gasUsed >= nextThreshold && nextThreshold <= targetTaskGasFloor {
+		if windowGasUsed > 0 && windowGasUsed+nextGas > snapshotThresholdGas {
 			path := filepath.Join(
 				artifactDir,
 				fmt.Sprintf("snapshot_%03d_step_%d_gas_%d.json", len(snapshotPaths), vm.State.StepCount, gasUsed),
 			)
-			snap := saveSnapshotAtGas(t, vm, gasUsed, nextThreshold, path)
+			snap := saveSnapshotAtGas(t, vm, gasUsed, snapshotThresholdGas, path)
 			snapshotPaths = append(snapshotPaths, path)
 			snapshotGasUsed = append(snapshotGasUsed, gasUsed)
 			index.AddSnapshot(filepath.Base(path), snap, gasUsed)
-			nextThreshold += snapshotThresholdGas
+			windowGasUsed = 0
 		}
+
+		require.NoError(t, vm.Step())
+		windowGasUsed += nextGas
 	}
 	runDuration := time.Since(start)
 
@@ -106,6 +112,7 @@ func TestFileBackedSnapshotsLongRun(t *testing.T) {
 	assert.GreaterOrEqual(t, task.TotalGas, targetTaskGasFloor)
 	assert.GreaterOrEqual(t, len(snapshotPaths), int(targetTaskGasFloor/snapshotThresholdGas)+2)
 
+	// fullVerify 打开时，除了快照 hash 验证外，还会额外为相邻区间生成完整 proof。
 	fullVerify := os.Getenv("PUREVM_GAS_SCALE_FULL_VERIFY") == "1"
 	persistProofFiles := os.Getenv("PUREVM_KEEP_PROOFS") == "1" || fullVerify
 	seq := core.SnapshotSequence{}
@@ -114,6 +121,7 @@ func TestFileBackedSnapshotsLongRun(t *testing.T) {
 	require.NoError(t, firstSnap.VerifyIntegrity())
 	require.NoError(t, seq.AddSnapshot(firstSnap, nil))
 
+	// 验证每一对相邻快照都满足：按同样阈值规则重放时，得到的下一个快照 hash 与承诺快照一致。
 	for i := 1; i < len(snapshotPaths); i++ {
 		startSnap, err := core.ReadSnapshotFile(snapshotPaths[i-1])
 		require.NoError(t, err)
@@ -122,12 +130,19 @@ func TestFileBackedSnapshotsLongRun(t *testing.T) {
 		require.NoError(t, startSnap.VerifyIntegrity())
 		require.NoError(t, endSnap.VerifyIntegrity())
 
-		deltaSteps := endSnap.Header.StepNumber - startSnap.Header.StepNumber
-		require.Greater(t, deltaSteps, uint64(0))
-		if fullVerify {
-			transitionProof, err := proof.VerifyAdjacentSnapshots(startSnap, endSnap, 0)
-			require.NoError(t, err)
+		nextResult, err := proof.VerifyNextSnapshotHash(startSnap, endSnap, snapshotThresholdGas)
+		require.NoError(t, err)
+		require.NoError(t, seq.AddSnapshot(endSnap, nil))
 
+		deltaSteps := endSnap.Header.StepNumber - startSnap.Header.StepNumber
+		require.Equal(t, deltaSteps, nextResult.Steps)
+		require.LessOrEqual(t, snapshotGasUsed[i]-snapshotGasUsed[i-1], snapshotThresholdGas)
+
+		if fullVerify {
+			segmentVM := core.NewVM(startSnap.State.Code, startSnap.State.Gas)
+			segmentVM.State = startSnap.State.Clone()
+			transitionProof, err := proof.GenerateTransitionProof(segmentVM, deltaSteps)
+			require.NoError(t, err)
 			if persistProofFiles {
 				proofPath := filepath.Join(
 					artifactDir,
@@ -136,23 +151,20 @@ func TestFileBackedSnapshotsLongRun(t *testing.T) {
 				require.NoError(t, transitionProof.WriteFile(proofPath))
 				require.NoError(t, index.SetAdjacentProof(i-1, filepath.Base(proofPath), deltaSteps, true))
 			}
-
-			assert.Equal(t, endSnap.Header.StateRoot, transitionProof.FinalHash)
-			link := transitionProof.Link()
-			require.NoError(t, seq.AddSnapshot(endSnap, &link))
-			t.Logf(
-				"adjacent snapshot verification: startOrdinal=%d endOrdinal=%d steps=%d gasUsedDelta=%d",
-				i-1,
-				i,
-				deltaSteps,
-				snapshotGasUsed[i]-snapshotGasUsed[i-1],
-			)
-		} else {
-			require.NoError(t, seq.AddSnapshot(endSnap, nil))
 		}
+
+		t.Logf(
+			"adjacent snapshot hash verification: startOrdinal=%d endOrdinal=%d steps=%d gasUsedDelta=%d final=%t",
+			i-1,
+			i,
+			deltaSteps,
+			snapshotGasUsed[i]-snapshotGasUsed[i-1],
+			nextResult.IsFinal,
+		)
 	}
 	require.NoError(t, index.WriteFile(indexPath))
 
+	// 默认模式下只抽样验证首段 / 中段 / 末段，避免长任务测试过慢。
 	for _, ordinal := range selectedOrdinals(len(index.Snapshots)) {
 		verifiedProof, err := verifySnapshotIndexPair(indexPath, ordinal, 0, true)
 		require.NoError(t, err)
@@ -183,6 +195,7 @@ func buildGasWeightedTask() gasWeightedTask {
 	return buildGasWeightedTaskForThreshold(targetTaskGasFloor, snapshotThresholdGas)
 }
 
+// buildGasWeightedTaskForThreshold 按给定总 Gas 和快照阈值生成一个倒计数循环任务。
 func buildGasWeightedTaskForThreshold(totalGasFloor, thresholdGas uint64) gasWeightedTask {
 	iterations := countdownIterationsForGasFloor(totalGasFloor)
 	totalGas := countdownGasForIterations(iterations)
@@ -203,6 +216,7 @@ func buildGasWeightedTaskForThreshold(totalGasFloor, thresholdGas uint64) gasWei
 	}
 }
 
+// countdownIterationsForGasFloor 反推需要多少次循环才能达到目标 Gas。
 func countdownIterationsForGasFloor(gasFloor uint64) uint32 {
 	if gasFloor <= countdownSetupAndExitGas {
 		return 0
@@ -216,10 +230,12 @@ func countdownIterationsForGasFloor(gasFloor uint64) uint32 {
 	return uint32(iterations)
 }
 
+// countdownGasForIterations 给出该倒计数循环的总 Gas 模型。
 func countdownGasForIterations(iterations uint32) uint64 {
 	return countdownSetupAndExitGas + uint64(iterations)*countdownLoopGas
 }
 
+// buildCountdownLoop 构造一个简单但可长时间运行的纯 EVM 风格循环任务。
 func buildCountdownLoop(iterations uint32) []byte {
 	code := []byte{
 		0x63, 0, 0, 0, 0,
@@ -239,6 +255,7 @@ func buildCountdownLoop(iterations uint32) []byte {
 	return code
 }
 
+// writeTaskArtifacts 把任务说明和字节码落到磁盘，方便链下/链上脚本复用。
 func writeTaskArtifacts(t *testing.T, dir string, task gasWeightedTask) {
 	t.Helper()
 
@@ -251,6 +268,7 @@ func writeTaskArtifacts(t *testing.T, dir string, task gasWeightedTask) {
 	require.NoError(t, os.WriteFile(bytecodePath, []byte(task.BytecodeHex+"\n"), 0o644))
 }
 
+// saveSnapshotAtGas 按当前 VM 状态生成快照，并把 gas 信息写进 Meta。
 func saveSnapshotAtGas(t *testing.T, vm *core.VM, gasUsed, threshold uint64, path string) *core.StandardSnapshot {
 	t.Helper()
 
@@ -265,6 +283,7 @@ func saveSnapshotAtGas(t *testing.T, vm *core.VM, gasUsed, threshold uint64, pat
 	return snap
 }
 
+// verifySnapshotIndexPair 模拟“从索引中选一个中间快照，然后按阈值规则推导下一个快照 hash”的恢复流程。
 func verifySnapshotIndexPair(indexPath string, ordinal int, proofSteps uint64, fullVerify bool) (*proof.TransitionProof, error) {
 	idx, err := core.ReadSnapshotIndexFile(indexPath)
 	if err != nil {
@@ -288,13 +307,22 @@ func verifySnapshotIndexPair(indexPath string, ordinal int, proofSteps uint64, f
 		return nil, err
 	}
 
-	if !fullVerify && startEntry.AdjacentProofSteps > 0 {
-		proofSteps = startEntry.AdjacentProofSteps
+	_, _ = proofSteps, fullVerify
+	result, err := proof.VerifyNextSnapshotHash(startSnap, endSnap, idx.SnapshotThresholdGas)
+	if err != nil {
+		return nil, err
 	}
 
-	return proof.VerifyAdjacentSnapshots(startSnap, endSnap, proofSteps)
+	vm := core.NewVM(startSnap.State.Code, startSnap.State.Gas)
+	vm.State = startSnap.State.Clone()
+	p, err := proof.GenerateTransitionProof(vm, result.Steps)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
+// selectedOrdinals 默认挑首段 / 中段 / 末段做抽样验证。
 func selectedOrdinals(snapshotCount int) []int {
 	if snapshotCount < 2 {
 		return nil
@@ -317,6 +345,7 @@ func selectedOrdinals(snapshotCount int) []int {
 	return selected
 }
 
+// artifactDir 决定长任务测试的产物写到临时目录还是 testdata。
 func artifactDir(t *testing.T) string {
 	t.Helper()
 

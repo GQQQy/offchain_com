@@ -32,6 +32,8 @@ contract MockChallengeResolver is IOptimisticChallengeResolver {
     }
 }
 
+// OptimisticTaskCoordinatorTest 覆盖用户发任务、执行方认领、验证者背书、
+// 验证者挑战、以及 PureVM challenge resolver 联动的经济流程。
 contract OptimisticTaskCoordinatorTest {
     ValidatorManager internal validatorManager;
     MockChallengeResolver internal mockChallengeResolver;
@@ -54,6 +56,7 @@ contract OptimisticTaskCoordinatorTest {
     bytes internal constant SNAPSHOT_BYTES_0 = bytes("snapshot-bytes-0");
     bytes internal constant SNAPSHOT_BYTES_1 = bytes("snapshot-bytes-1");
 
+    // setUp 初始化验证者质押池、挑战解析器和协调合约，并给测试账户预充余额。
     function setUp() public {
         validatorManager = new ValidatorManager(1 ether, 1 days);
         mockChallengeResolver = new MockChallengeResolver();
@@ -76,6 +79,8 @@ contract OptimisticTaskCoordinatorTest {
         validatorManager.stake{value: 9 ether}();
     }
 
+    // testPostClaimSubmitAttestAndFinalize 验证“正确执行”的正常路径：
+    // 执行方提交结果、验证者背书、窗口期结束后按比例分润。
     function testPostClaimSubmitAttestAndFinalize() public {
         bytes32 taskId = _postTask();
 
@@ -108,6 +113,8 @@ contract OptimisticTaskCoordinatorTest {
         require(requester.balance >= requesterBalanceBefore, "requester should receive remainder refund");
     }
 
+    // testSelectedValidatorCanChallengeAndSplitExecutorBond 验证被选中的验证者挑战成功后，
+    // 能和用户一起分执行方 bond。
     function testSelectedValidatorCanChallengeAndSplitExecutorBond() public {
         bytes32 taskId = _postTask();
 
@@ -132,6 +139,7 @@ contract OptimisticTaskCoordinatorTest {
         require(requester.balance > requesterBalanceBefore, "requester should receive compensation");
     }
 
+    // testUnselectedValidatorCannotChallenge 验证只有被随机选中的验证者才能发起挑战。
     function testUnselectedValidatorCannotChallenge() public {
         bytes32 taskId = _postTask();
 
@@ -152,6 +160,7 @@ contract OptimisticTaskCoordinatorTest {
         require(!ok, "unselected validator should not challenge");
     }
 
+    // testChallengeViaPureVMResolver 验证协调合约在挑战时会真正进入 PureVM checkpoint 验证路径。
     function testChallengeViaPureVMResolver() public {
         _preparePureVMChallengePath();
 
@@ -172,8 +181,8 @@ contract OptimisticTaskCoordinatorTest {
                 fromOrdinal: 0,
                 nextCheckpoint: PureVMTypes.CheckpointInput({
                     stepNumber: 2_918_921,
-                    gasUsed: 12_000_001,
-                    gasRemaining: 288_000_019,
+                    gasUsed: 11_999_998,
+                    gasRemaining: 288_000_022,
                     stateRoot: STATE_ROOT_1,
                     snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
                     snapshotURI: "ipfs://snapshot-1"
@@ -189,10 +198,12 @@ contract OptimisticTaskCoordinatorTest {
         require(requester.balance > requesterBalanceBefore, "requester should be compensated after challenge");
     }
 
+    // _postTask 用统一参数发布一个 optimistic 任务。
     function _postTask() internal returns (bytes32) {
         return _postTaskWithCoordinator(coordinator, keccak256("summary"), keccak256("state-root"));
     }
 
+    // _postTaskWithCoordinator 允许测试在不同 coordinator 实例上复用同一套任务发布逻辑。
     function _postTaskWithCoordinator(OptimisticTaskCoordinator target, bytes32 summaryHash, bytes32)
         internal
         returns (bytes32)
@@ -214,6 +225,7 @@ contract OptimisticTaskCoordinatorTest {
         );
     }
 
+    // _preparePureVMChallengePath 提前准备一条可供 challenge resolver 使用的 PureVM task。
     function _preparePureVMChallengePath() internal {
         PureVMTypes.TaskCreation memory creation = PureVMTypes.TaskCreation({
             verifier: address(pureVMVerifier),
@@ -228,6 +240,7 @@ contract OptimisticTaskCoordinatorTest {
         pureVMTaskManager.createTask(creation);
     }
 
+    // _pureVMTaskId 用和 createTask 相同的规则计算测试里那条 PureVM task 的 taskId。
     function _pureVMTaskId() internal view returns (bytes32) {
         return pureVMTaskManager.computeTaskId(
             address(this),

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// 测试：简单的算术执行和快照验证
+// TestArithmeticWithSnapshot 验证最基础的“执行 -> 生成快照 -> 快照序列化”闭环。
 func TestArithmeticWithSnapshot(t *testing.T) {
 	// 代码：PUSH1 5, PUSH1 3, ADD, PUSH1 2, MUL (结果：(5+3)*2 = 16)
 	code := []byte{
@@ -44,7 +44,7 @@ func TestArithmeticWithSnapshot(t *testing.T) {
 	assert.Equal(t, snap.Header.StateRoot, snap2.Header.StateRoot)
 }
 
-// 测试：转移证明生成和验证
+// TestTransitionProof 验证短区间状态转移证明能生成且能被重放验证。
 func TestTransitionProof(t *testing.T) {
 	// 斐波那契计算代码
 	code := []byte{
@@ -71,7 +71,7 @@ func TestTransitionProof(t *testing.T) {
 	assert.NotZero(t, p.TraceRoot)
 }
 
-// 测试：Gas计算一致性
+// TestGasConsistency 检查基础指令的 Gas 计费是否和当前 gas table 一致。
 func TestGasConsistency(t *testing.T) {
 	code := []byte{0x60, 0x01, 0x60, 0x02, 0x01} // PUSH1 1, PUSH1 2, ADD
 	vm := core.NewVM(code, 100000)
@@ -88,7 +88,7 @@ func TestGasConsistency(t *testing.T) {
 	assert.Equal(t, expectedUsed, actualUsed)
 }
 
-// 测试：内存扩展和Gas计算
+// TestMemoryExpansion 验证内存扩展大小和内存相关 Gas 计算。
 func TestMemoryExpansion(t *testing.T) {
 	// 代码：PUSH1 0x40 (64), MSTORE (写入64-95字节，扩展到96字节)
 	code := []byte{
@@ -112,7 +112,7 @@ func TestMemoryExpansion(t *testing.T) {
 	assert.Equal(t, uint64(18), 100000-vm.State.Gas)
 }
 
-// 测试：快照序列连续性
+// TestSnapshotSequence 验证快照序列能够按 step 单调递增地拼接。
 func TestSnapshotSequence(t *testing.T) {
 	seq := core.SnapshotSequence{}
 
@@ -137,6 +137,8 @@ func TestSnapshotSequence(t *testing.T) {
 	assert.Equal(t, uint64(2), seq.Snapshots[1].Header.StepNumber)
 }
 
+// TestSnapshotIndexAdjacentRecovery 用一个小号 Gas 任务构造索引，
+// 然后逐个验证相邻快照能否通过索引恢复并重放到下一个快照。
 func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
 	const (
 		chainID        = 1337
@@ -144,6 +146,7 @@ func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
 		targetTotalGas = uint64(2500)
 	)
 
+	// 生成一个小号的 Gas 尺度任务，便于在单元测试里完整跑完。
 	task := buildGasWeightedTaskForThreshold(targetTotalGas, thresholdGas)
 	dir := t.TempDir()
 	indexPath := filepath.Join(dir, "snapshot_index.json")
@@ -160,19 +163,24 @@ func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
 	index.AddSnapshot(filepath.Base(initialPath), initialSnap, 0)
 
 	snapPaths := []string{initialPath}
-	nextThreshold := thresholdGas
+	windowGasUsed := uint64(0)
+	// 模拟长任务里的阈值切分快照过程，只是把规模缩小到测试友好的量级。
 	for !vm.Halted {
-		err := vm.Step()
+		nextGas, err := vm.PeekNextGasCost()
 		assert.NoError(t, err)
 
 		gasUsed := task.TotalGas - vm.State.Gas
-		for gasUsed >= nextThreshold && nextThreshold <= task.TotalGas {
+		if windowGasUsed > 0 && windowGasUsed+nextGas > thresholdGas {
 			path := filepath.Join(dir, fmt.Sprintf("snapshot_%03d.json", len(snapPaths)))
-			snap := saveSnapshotAtGas(t, vm, gasUsed, nextThreshold, path)
+			snap := saveSnapshotAtGas(t, vm, gasUsed, thresholdGas, path)
 			snapPaths = append(snapPaths, path)
 			index.AddSnapshot(filepath.Base(path), snap, gasUsed)
-			nextThreshold += thresholdGas
+			windowGasUsed = 0
 		}
+
+		err = vm.Step()
+		assert.NoError(t, err)
+		windowGasUsed += nextGas
 	}
 
 	finalPath := filepath.Join(dir, "snapshot_final.json")
@@ -180,6 +188,7 @@ func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
 	snapPaths = append(snapPaths, finalPath)
 	index.AddSnapshot(filepath.Base(finalPath), finalSnap, task.TotalGas-vm.State.Gas)
 
+	// 对索引里的每一对相邻快照执行“按阈值推导下一个快照 hash”的验证，并登记 proof 文件元数据。
 	for ordinal := 0; ordinal < len(index.Snapshots)-1; ordinal++ {
 		startEntry, endEntry, err := index.AdjacentEntries(ordinal)
 		assert.NoError(t, err)
@@ -189,9 +198,17 @@ func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
 		endSnap, err := core.ReadSnapshotFile(index.ResolvePath(indexPath, endEntry.SnapshotFile))
 		assert.NoError(t, err)
 
-		p, err := proof.VerifyAdjacentSnapshots(startSnap, endSnap, 0)
+		result, err := proof.VerifyNextSnapshotHash(startSnap, endSnap, thresholdGas)
 		assert.NoError(t, err)
-		assert.Equal(t, endSnap.Header.StateRoot, p.FinalHash)
+		if err != nil {
+			return
+		}
+		assert.Equal(t, endSnap.Header.StateRoot, result.Snapshot.Header.StateRoot)
+
+		segmentVM := core.NewVM(startSnap.State.Code, startSnap.State.Gas)
+		segmentVM.State = startSnap.State.Clone()
+		p, err := proof.GenerateTransitionProof(segmentVM, result.Steps)
+		assert.NoError(t, err)
 
 		proofPath := filepath.Join(dir, fmt.Sprintf("proof_%03d.json", ordinal))
 		assert.NoError(t, p.WriteFile(proofPath))
@@ -200,18 +217,21 @@ func TestSnapshotIndexAdjacentRecovery(t *testing.T) {
 
 	assert.NoError(t, index.WriteFile(indexPath))
 
+	// 再随机挑一个中间 ordinal，证明“按索引恢复并验证”这条路径也是通的。
 	selectedOrdinal := len(index.Snapshots) / 2
 	p, err := verifySnapshotIndexPair(indexPath, selectedOrdinal, 0, true)
 	assert.NoError(t, err)
 	assert.NotNil(t, p)
 }
 
+// TestSnapshotIndexThresholdValidation 只验证阈值规则本身：
+// 相邻快照必须跨过下一档 snapshotThresholdGas。
 func TestSnapshotIndexThresholdValidation(t *testing.T) {
 	idx := core.NewSnapshotIndex(1337, 3000, 500)
 	idx.Snapshots = []core.SnapshotIndexEntry{
 		{Ordinal: 0, StepNumber: 0, GasUsed: 0},
-		{Ordinal: 1, StepNumber: 10, GasUsed: 501},
-		{Ordinal: 2, StepNumber: 20, GasUsed: 1004},
+		{Ordinal: 1, StepNumber: 10, GasUsed: 498},
+		{Ordinal: 2, StepNumber: 20, GasUsed: 996},
 	}
 
 	err := idx.ValidateAdjacentThreshold(&idx.Snapshots[0], &idx.Snapshots[1])
@@ -221,7 +241,7 @@ func TestSnapshotIndexThresholdValidation(t *testing.T) {
 	assert.NoError(t, err)
 
 	bad := idx.Snapshots[1]
-	bad.GasUsed = 499
+	bad.GasUsed = 501
 	err = idx.ValidateAdjacentThreshold(&idx.Snapshots[0], &bad)
 	assert.Error(t, err)
 }

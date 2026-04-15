@@ -22,7 +22,7 @@ contract PureVMTaskManager {
     error UnverifiedCheckpoint();
     error InvalidCheckpointProgression();
     error InvalidGasAccounting();
-    error ThresholdBoundaryNotReached(uint64 gasUsed, uint64 expectedBoundary);
+    error SegmentGasThresholdExceeded(uint64 segmentGasUsed, uint64 threshold);
     error StartSnapshotHashMismatch();
     error VerificationFailed();
     error FinalRootMismatch(bytes32 got, bytes32 want);
@@ -315,9 +315,9 @@ contract PureVMTaskManager {
             return;
         }
 
-        uint64 expectedBoundary = ((start.gasUsed / task.snapshotThresholdGas) + 1) * task.snapshotThresholdGas;
-        if (endGasUsed < expectedBoundary) {
-            revert ThresholdBoundaryNotReached(endGasUsed, expectedBoundary);
+        uint64 segmentGasUsed = endGasUsed - start.gasUsed;
+        if (segmentGasUsed > task.snapshotThresholdGas) {
+            revert SegmentGasThresholdExceeded(segmentGasUsed, task.snapshotThresholdGas);
         }
     }
 }

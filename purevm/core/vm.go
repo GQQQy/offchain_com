@@ -128,6 +128,14 @@ func (vm *VM) Step() error {
 	return nil
 }
 
+// PeekNextGasCost 预估下一步将消耗的 Gas，但不修改 VM 状态。
+func (vm *VM) PeekNextGasCost() (uint64, error) {
+	if vm.Halted || vm.State.PC >= uint64(len(vm.State.Code)) {
+		return 0, nil
+	}
+	return vm.GasCalc.CalcOpcodeCost(OpCode(vm.State.Code[vm.State.PC]), vm.State)
+}
+
 // Run 执行直到停机
 func (vm *VM) Run() error {
 	for !vm.Halted && vm.Err == nil {

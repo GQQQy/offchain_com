@@ -30,6 +30,8 @@ contract MockPureVMVerifier is IPureVMVerifier {
     }
 }
 
+// PureVMTaskManagerTest 覆盖任务创建、阈值检查、checkpoint 验证、最终收尾、
+// 以及“上传快照到链上 -> 验证 -> 删除快照”的生命周期。
 contract PureVMTaskManagerTest {
     PureVMTaskManager internal manager;
     MockPureVMVerifier internal verifier;
@@ -45,12 +47,14 @@ contract PureVMTaskManagerTest {
     bytes internal constant SNAPSHOT_BYTES_0 = bytes("snapshot-bytes-0");
     bytes internal constant SNAPSHOT_BYTES_1 = bytes("snapshot-bytes-1");
 
+    // setUp 部署一套最小依赖：mock verifier + task manager + snapshot store。
     function setUp() public {
         verifier = new MockPureVMVerifier();
         manager = new PureVMTaskManager();
         snapshotStore = new PureVMSnapshotStore();
     }
 
+    // testCreateTaskRegistersInitialCheckpoint 验证创建任务时会同步登记 ordinal=0 的初始 checkpoint。
     function testCreateTaskRegistersInitialCheckpoint() public {
         bytes32 taskId = _createTask();
 
@@ -73,13 +77,14 @@ contract PureVMTaskManagerTest {
         _assertTrue(initial.verified, "initial verified");
     }
 
+    // testVerifyAndAppendCheckpoint 验证正常的相邻 checkpoint 可以被链上追加并记录 proof 元数据。
     function testVerifyAndAppendCheckpoint() public {
         bytes32 taskId = _createTask();
 
         PureVMTypes.CheckpointInput memory next = PureVMTypes.CheckpointInput({
             stepNumber: 2_918_921,
-            gasUsed: 12_000_001,
-            gasRemaining: 288_000_019,
+            gasUsed: 11_999_998,
+            gasRemaining: 288_000_022,
             stateRoot: STATE_ROOT_1,
             snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
             snapshotURI: "ipfs://snapshot-1"
@@ -111,13 +116,14 @@ contract PureVMTaskManagerTest {
         _assertTrue(proofMeta.fullProof, "proof full");
     }
 
+    // testRejectCheckpointBelowThresholdBoundary 验证链上会拒绝没有跨过 snapshotThresholdGas 边界的 checkpoint。
     function testRejectCheckpointBelowThresholdBoundary() public {
         bytes32 taskId = _createTask();
 
         PureVMTypes.CheckpointInput memory invalid = PureVMTypes.CheckpointInput({
             stepNumber: 100,
-            gasUsed: 11_999_999,
-            gasRemaining: 288_000_021,
+            gasUsed: 12_000_001,
+            gasRemaining: 288_000_019,
             stateRoot: STATE_ROOT_1,
             snapshotBlobHash: keccak256("bad-snapshot"),
             snapshotURI: "ipfs://bad"
@@ -125,18 +131,19 @@ contract PureVMTaskManagerTest {
 
         bytes memory proofBytes = abi.encode(true, STATE_ROOT_1, uint64(100), TRACE_ROOT_1);
         vm.expectRevert(
-            abi.encodeWithSelector(PureVMTaskManager.ThresholdBoundaryNotReached.selector, uint64(11_999_999), uint64(12_000_000))
+            abi.encodeWithSelector(PureVMTaskManager.SegmentGasThresholdExceeded.selector, uint64(12_000_001), uint64(12_000_000))
         );
         manager.verifyAndAppendCheckpoint(taskId, 0, invalid, SNAPSHOT_BYTES_0, proofBytes, "ipfs://bad-proof");
     }
 
+    // testFinalizeTaskOnTotalGasReached 验证当 gasUsed 到达 totalGas 时，任务会被 finalization。
     function testFinalizeTaskOnTotalGasReached() public {
         bytes32 taskId = _createTask();
 
         PureVMTypes.CheckpointInput memory cp1 = PureVMTypes.CheckpointInput({
             stepNumber: 2_918_921,
-            gasUsed: 12_000_001,
-            gasRemaining: 288_000_019,
+            gasUsed: 11_999_998,
+            gasRemaining: 288_000_022,
             stateRoot: STATE_ROOT_1,
             snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
             snapshotURI: "ipfs://snapshot-1"
@@ -161,6 +168,7 @@ contract PureVMTaskManagerTest {
         _assertTrue(manager.isStateRootVerified(taskId, STATE_ROOT_2), "final root verified");
     }
 
+    // testUploadVerifyAndDeleteSnapshotFromStore 验证“快照临时上链 -> 读取验证 -> 删除”的完整过程。
     function testUploadVerifyAndDeleteSnapshotFromStore() public {
         bytes32 taskId = _createTask();
 
@@ -170,8 +178,8 @@ contract PureVMTaskManagerTest {
 
         PureVMTypes.CheckpointInput memory next = PureVMTypes.CheckpointInput({
             stepNumber: 2_918_921,
-            gasUsed: 12_000_001,
-            gasRemaining: 288_000_019,
+            gasUsed: 11_999_998,
+            gasRemaining: 288_000_022,
             stateRoot: STATE_ROOT_1,
             snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
             snapshotURI: "ipfs://snapshot-1"
@@ -187,6 +195,7 @@ contract PureVMTaskManagerTest {
         _assertFalse(snapshotStore.hasSnapshot(taskId, 0), "snapshot deleted");
     }
 
+    // _createTask 复用一套固定任务参数，避免每个测试手写同样的创建逻辑。
     function _createTask() internal returns (bytes32) {
         PureVMTypes.TaskCreation memory creation = PureVMTypes.TaskCreation({
             verifier: address(verifier),

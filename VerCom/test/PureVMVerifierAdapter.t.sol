@@ -20,15 +20,19 @@ contract MockSnapshotValidatorPrecompile {
     }
 }
 
+// PureVMVerifierAdapterTest 只验证 adapter 是否按 Go 预编译要求的 payload 格式发包。
 contract PureVMVerifierAdapterTest {
     PureVMVerifierAdapter internal adapter;
     MockSnapshotValidatorPrecompile internal target;
 
+    // setUp 部署一个静态、无状态的 mock precompile target。
     function setUp() public {
         target = new MockSnapshotValidatorPrecompile();
         adapter = new PureVMVerifierAdapter(address(target));
     }
 
+    // testAdapterEncodesPrecompilePayload 验证 adapter 会拼出
+    // [stateLen][proofLen][state][proof] 这一真实 precompile 输入格式。
     function testAdapterEncodesPrecompilePayload() public view {
         bytes memory stateBytes = bytes("{\"state\":\"start\"}");
         bytes memory proofBytes = bytes("{\"proof\":\"raw-json\"}");
