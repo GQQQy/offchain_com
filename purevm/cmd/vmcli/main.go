@@ -195,12 +195,20 @@ func verifyIndex(indexFile string, ordinal int, proofSteps uint64, full bool) {
 	}
 
 	start := time.Now()
-	p, err := proof.VerifyAdjacentSnapshots(startSnap, endSnap, proofSteps)
+	result, err := proof.VerifyNextSnapshotHash(startSnap, endSnap, idx.SnapshotThresholdGas)
 	if err != nil {
 		fmt.Printf("Index verification FAILED: %v\n", err)
 		os.Exit(1)
 	}
 	elapsed := time.Since(start)
+
+	vm := core.NewVM(startSnap.State.Code, startSnap.State.Gas)
+	vm.State = startSnap.State.Clone()
+	p, err := proof.GenerateTransitionProof(vm, result.Steps)
+	if err != nil {
+		fmt.Printf("Index proof synthesis FAILED: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("Index verification PASSED in %v\n", elapsed)
 	fmt.Printf("Start ordinal: %d\n", startEntry.Ordinal)
@@ -210,11 +218,8 @@ func verifyIndex(indexFile string, ordinal int, proofSteps uint64, full bool) {
 	fmt.Printf("Verified steps:%d\n", len(p.Steps))
 	fmt.Printf("Initial root:  %s\n", p.InitialHash.Hex())
 	fmt.Printf("Final root:    %s\n", p.FinalHash.Hex())
-	if proofSteps == 0 || proofSteps == endEntry.StepNumber-startEntry.StepNumber {
-		fmt.Printf("Mode:          full adjacent interval\n")
-	} else {
-		fmt.Printf("Mode:          windowed adjacent verification\n")
-	}
+	fmt.Printf("Committed next root: %s\n", endSnap.Header.StateRoot.Hex())
+	fmt.Printf("Mode:          next snapshot hash verification\n")
 }
 
 func parseHex(s string) []byte {

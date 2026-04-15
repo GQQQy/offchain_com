@@ -1,0 +1,4 @@
+./file.go
+./merkle.go
+./snapshot_verify.go
+./transition.go

@@ -180,6 +180,92 @@ forge script script/RunPureVMChallengeE2E.s.sol:RunPureVMChallengeE2EScript --rp
 - 验证者挑战
 - 进入 PureVM challenge resolver
 
+## `.env.example`
+
+仓库里已经提供了：
+
+- [`.env.example`](./.env.example)
+
+它把这些脚本需要的环境变量都列出来了：
+
+- 合约地址
+- 三个参与方私钥
+- PureVM task 元数据
+- 快照 / proof 文件路径
+- optimistic task 的奖励和 bond 配置
+
+## 基于当前真实快照产物的示例
+
+当前可以直接参考这批真实链下产物：
+
+- [snapshot_index.json](../purevm/test/testdata/long_run_artifacts/20260414_165531/snapshot_index.json)
+- [task_manifest.json](../purevm/test/testdata/long_run_artifacts/20260414_165531/task_manifest.json)
+- [snapshot_000_initial.json](../purevm/test/testdata/long_run_artifacts/20260414_165531/snapshot_000_initial.json)
+- [snapshot_001_step_2918921_gas_12000001.json](../purevm/test/testdata/long_run_artifacts/20260414_165531/snapshot_001_step_2918921_gas_12000001.json)
+- `proof_001_from_0_steps_2918921.json`
+
+如果本地还没有 proof 文件，可以先在 `purevm` 目录执行：
+
+```powershell
+$root=(Get-Location).Path
+$env:GOCACHE=Join-Path $root '.gocache'
+$env:GOMODCACHE=Join-Path $root '.gomodcache'
+$env:GOPATH=Join-Path $root '.gopath'
+$env:GOSUMDB='off'
+$env:GOPROXY='https://proxy.golang.org'
+go run ./cmd/vmcli -cmd prove -code 63007bb84c5b80156011576001036005565b00 -gas 300000020 -steps 2918921 -proof test\testdata\long_run_artifacts\20260414_165531\proof_001_from_0_steps_2918921.json
+```
+
+然后把 `VerCom/.env.example` 复制成 `.env`，至少填好：
+
+- `PUREVM_VERIFIER_TARGET`
+- `PUREVM_VERIFIER`
+- `PUREVM_TASK_MANAGER`
+- `PUREVM_SNAPSHOT_STORE`
+- `PUREVM_CHALLENGE_RESOLVER`
+- `VALIDATOR_MANAGER`
+- `OPTIMISTIC_COORDINATOR`
+- `REQUESTER_PRIVATE_KEY`
+- `EXECUTOR_PRIVATE_KEY`
+- `VALIDATOR_PRIVATE_KEY`
+
+再确认这些示例值：
+
+- `PUREVM_ARTIFACT_DIR=E:/crosschain/offchain_com/purevm/test/testdata/long_run_artifacts/20260414_165531`
+- `PUREVM_FROM_ORDINAL=0`
+- `PUREVM_SNAPSHOT_FILE=...snapshot_000_initial.json`
+- `PUREVM_PROOF_FILE=...proof_001_from_0_steps_2918921.json`
+- `PUREVM_NEXT_STEP_NUMBER=2918921`
+- `PUREVM_NEXT_GAS_USED=11999998`
+- `PUREVM_NEXT_GAS_REMAINING=288000022`
+- `PUREVM_NEXT_STATE_ROOT=0x87f7a67d174168bf022f2f292accbc7472779491c6961ba89a9b0abf68e6d227`
+
+完整运行顺序建议是：
+
+1. 部署
+
+```powershell
+forge script script/DeployVerCom.s.sol:DeployVerComScript --rpc-url <RPC_URL> --broadcast
+```
+
+2. 用部署返回的地址填 `.env`
+
+3. 跑端到端脚本
+
+```powershell
+forge script script/RunPureVMChallengeE2E.s.sol:RunPureVMChallengeE2EScript --rpc-url <RPC_URL> --broadcast
+```
+
+这个脚本会完成：
+
+- 创建 PureVM task
+- 发布 optimistic task
+- 验证者 stake
+- 执行方 claim
+- 执行方提交错误结果
+- 选中验证者发起 challenge
+- challenge 进入 `PureVMChallengeResolver -> PureVMTaskManager -> PureVMVerifierAdapter`
+
 ## 注意事项
 
 - 当前合约和测试已经接上了 PureVM challenge 框架，但真正部署时仍需把 `PUREVM_VERIFIER_TARGET` 指向正确的 verifier / precompile 地址。
