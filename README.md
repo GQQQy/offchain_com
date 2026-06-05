@@ -1326,24 +1326,3 @@ forge test --match-contract RunPureVMChallengeE2EScriptTest
 8. `PureVMSnapshotStore` 适合测试和小 payload 演示，不应作为生产大规模 DA 方案。
 9. `block.prevrandao` 加 task/result 作为验证者选择随机源适合原型，生产场景应评估可操纵性和替代随机源。
 10. 合约当前未引入完整治理/升级/暂停机制；若进入真实资金环境，应补充权限、升级、应急暂停和审计。
-
-## 16. 下一步建议
-
-短期建议：
-
-- 为 `verifyAndAppendCheckpointFromStore(...)` 增加更接近真实 payload 尺寸的测试。
-- 继续评估长任务 proof 压缩或分段证明方案，避免逐步 JSON proof 在大段上超过 1MB payload 上限。
-- 将可选 E2E 脚本测试接入 CI 时，需要在 CI 中先运行 `vmcli -cmd generate-artifacts` 生成本地 testdata。
-
-中期建议：
-
-- 把 Go verifier/precompile 封装成可部署或可模拟的稳定 target。
-- 为 snapshot/proof/subdivision 增加 manifest 规范，统一 artifact 目录结构。
-- 引入更明确的 DA 可用性检查流程，例如链下 watcher 或索引服务。
-- 持续维护 PureVM opcode 语义表，确保新增指令、Gas 规则和 verifier 行为同步更新。
-
-长期建议：
-
-- 对 verifier 进行形式化或半形式化审计，特别是 state hash、code hash、Gas 和内存语义。
-- 评估将最小争议段证明替换为更紧凑的证明系统或专用 precompile。
-- 对资金模型、验证者选择和挑战激励做仿真，调整 bond、reward、slash 参数。
