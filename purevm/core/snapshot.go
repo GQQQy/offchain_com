@@ -11,14 +11,14 @@ import (
 
 // SnapshotHeaderV1 快照头版本1（标准化格式）
 type SnapshotHeaderV1 struct {
-	Version     uint16      `json:"version"`
-	ChainID     uint64      `json:"chain_id"`
-	BlockHeight uint64      `json:"block_height"`
-	Timestamp   uint64      `json:"timestamp"`
-	StateRoot   common.Hash `json:"state_root"`  // Keccak256(state)
-	CodeHash    common.Hash `json:"code_hash"`   // 代码哈希（防篡改）
-	StepNumber  uint64      `json:"step_number"` // 执行到第几步
-	GasRemaining uint64     `json:"gas_remaining"`
+	Version      uint16      `json:"version"`
+	ChainID      uint64      `json:"chain_id"`
+	BlockHeight  uint64      `json:"block_height"`
+	Timestamp    uint64      `json:"timestamp"`
+	StateRoot    common.Hash `json:"state_root"`  // Keccak256(state)
+	CodeHash     common.Hash `json:"code_hash"`   // 代码哈希（防篡改）
+	StepNumber   uint64      `json:"step_number"` // 执行到第几步
+	GasRemaining uint64      `json:"gas_remaining"`
 }
 
 // StandardSnapshot 标准快照（链下保存/链上验证的统一格式）
@@ -36,13 +36,13 @@ func NewStandardSnapshot(state *VMState, chainID uint64) *StandardSnapshot {
 
 	return &StandardSnapshot{
 		Header: SnapshotHeaderV1{
-			Version:     1,
-			ChainID:     chainID,
-			BlockHeight: 0, // 由调用者更新
-			Timestamp:   uint64(time.Now().Unix()),
-			StateRoot:   stateRoot,
-			CodeHash:    state.CodeHash,
-			StepNumber:  state.StepCount,
+			Version:      1,
+			ChainID:      chainID,
+			BlockHeight:  0, // 由调用者更新
+			Timestamp:    uint64(time.Now().Unix()),
+			StateRoot:    stateRoot,
+			CodeHash:     state.CodeHash,
+			StepNumber:   state.StepCount,
 			GasRemaining: state.Gas,
 		},
 		State: *state.Clone(),
@@ -65,6 +65,14 @@ func DeserializeSnapshot(data []byte) (*StandardSnapshot, error) {
 
 // VerifyIntegrity 验证快照完整性（哈希匹配）
 func (s *StandardSnapshot) VerifyIntegrity() error {
+	if s.Header.CodeHash != s.State.CodeHash {
+		return fmt.Errorf("header code hash mismatch: header %s, state %s",
+			s.Header.CodeHash.Hex(), s.State.CodeHash.Hex())
+	}
+	if err := s.State.VerifyCodeHash(); err != nil {
+		return err
+	}
+
 	calcHash := s.State.Hash()
 	if calcHash != s.Header.StateRoot {
 		return fmt.Errorf("integrity check failed: calculated %s, header claims %s",

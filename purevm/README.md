@@ -16,6 +16,7 @@
 - 快照索引 `snapshot_index.json`
 - “按同样阈值规则推导下一个快照 hash”的恢复验证
 - 状态转移 proof 生成与重放验证
+- 执行方/验证者两条 checkpoint 承诺序列的第一分歧段定位
 - Go 版预编译验证原型
 
 ## 核心目录
@@ -24,7 +25,7 @@
 purevm/
   cmd/vmcli/      # 命令行工具
   core/           # VM、状态、Gas、快照、索引
-  proof/          # 证明生成、相邻快照验证
+  proof/          # 证明生成、相邻快照验证、分歧段定位
   precompile/     # 预编译原型
   test/           # 集成测试和长任务测试
 ```
@@ -39,6 +40,18 @@ purevm/
 4. 然后再执行下一步。
 
 验证时会从起始快照恢复，按同样规则推导“下一个快照”，并比较其 `stateRoot` 与承诺快照是否一致。
+
+新生成的快照 JSON 中，`state.code`、`state.memory`、`state.call_data` 都使用 `0x` 前缀十六进制字符串，方便 Foundry 脚本用 `vm.parseJsonBytes` 读取。读取逻辑仍兼容旧版 Go 默认 base64 `[]byte` JSON。快照完整性会同时检查 `stateRoot` 和实际 bytecode 与 `codeHash` 的绑定。
+
+## 分歧定位
+
+验证者可以用本地重放得到的 `snapshot_index.json` 与执行方提交的 `snapshot_index.json` 做第一层定位：
+
+```powershell
+go run ./cmd/vmcli -cmd locate-dispute -claimed-index executor_snapshot_index.json -verified-index validator_snapshot_index.json
+```
+
+该命令会返回最早分歧的 `fromOrdinal` / `toOrdinal`、共同起始 root、双方 next root 和原因。链上 challenge payload 的 `fromOrdinal` 应优先使用这里定位出的最早分歧段。
 
 ## 命令行
 
@@ -62,16 +75,42 @@ go run ./cmd/vmcli -cmd snapshot -code 6005600301 -steps 2 -snap snapshot.json
 go run ./cmd/vmcli -cmd prove -code 6005600301 -steps 2 -proof proof.json
 ```
 
+### 从已有快照恢复并生成 proof
+
+```powershell
+go run ./cmd/vmcli -cmd prove-snapshot -snap snapshot.json -steps 2 -proof proof.json
+```
+
+### 检查快照完整性
+
+```powershell
+go run ./cmd/vmcli -cmd check-snapshot -snap snapshot.json
+```
+
 ### 直接验证快照 + proof
 
 ```powershell
 go run ./cmd/vmcli -cmd verify -snap snapshot.json -proof proof.json
 ```
 
+### 按预编译输入格式验证快照 + proof
+
+```powershell
+go run ./cmd/vmcli -cmd verify-precompile -snap snapshot.json -proof proof.json
+```
+
+该命令会模拟 Solidity adapter 的 `[stateLen:4][proofLen:4][snapshotBytes][proofBytes]` 输入，并解析 128 字节 `[valid][finalStateRoot][verifiedSteps][traceRoot]` 响应。
+
 ### 按索引选择中间快照做相邻验证
 
 ```powershell
 go run ./cmd/vmcli -cmd verify-index -index path\\to\\snapshot_index.json -ordinal 3
+```
+
+### 定位第一分歧段
+
+```powershell
+go run ./cmd/vmcli -cmd locate-dispute -claimed-index executor_snapshot_index.json -verified-index validator_snapshot_index.json
 ```
 
 ## 测试
@@ -83,9 +122,9 @@ $root=(Get-Location).Path
 $env:GOCACHE=Join-Path $root '.gocache'
 $env:GOMODCACHE=Join-Path $root '.gomodcache'
 $env:GOPATH=Join-Path $root '.gopath'
-$env:GOSUMDB='off'
+$env:GOSUMDB='sum.golang.org'
 $env:GOPROXY='https://proxy.golang.org'
-go test -v -mod=mod ./test
+go test -v -mod=mod ./...
 ```
 
 ### 完整 Gas 任务测试
@@ -118,8 +157,13 @@ purevm/test/testdata/long_run_artifacts/<timestamp>/
 - 快照序列拼接
 - 快照索引恢复验证
 - 快照阈值规则验证
+- 第一分歧 checkpoint 段定位
+- 快照 JSON 十六进制 bytes 格式
+- 完整 snapshot 走 Go 预编译验证
+- bytecode 篡改检测
 
 ## 当前边界
 
 - 当前实现的是一组 PureVM 支持的 EVM 风格 opcode 子集，不是完整 EVM。
 - 长任务测试默认不会全量生成所有 proof 文件，避免体积过大；需要时可显式打开。
+- 更完整的交接说明见根目录 [`../DESIGN_HANDOFF.md`](../DESIGN_HANDOFF.md)。

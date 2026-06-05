@@ -10,6 +10,7 @@ import {IOptimisticChallengeResolver} from "../src/interfaces/IOptimisticChallen
 import {IPureVMVerifier} from "../src/interfaces/IPureVMVerifier.sol";
 
 interface Vm {
+    function expectRevert(bytes calldata) external;
     function prank(address) external;
     function startPrank(address) external;
     function stopPrank() external;
@@ -21,13 +22,12 @@ address constant HEVM_ADDRESS = address(uint160(uint256(keccak256("hevm cheat co
 Vm constant vm = Vm(HEVM_ADDRESS);
 
 contract MockChallengeResolver is IOptimisticChallengeResolver {
-    function validateChallenge(
-        bytes32,
-        bytes32,
-        bytes32,
-        bytes32,
-        bytes calldata challengeData
-    ) external pure override returns (bool success, bytes32 actualResultHash, bytes32 actualStateRoot) {
+    function validateChallenge(address, bytes32, bytes32, bytes32, bytes32, bytes calldata challengeData)
+        external
+        pure
+        override
+        returns (bool success, bytes32 actualResultHash, bytes32 actualStateRoot)
+    {
         return abi.decode(challengeData, (bool, bytes32, bytes32));
     }
 }
@@ -64,6 +64,7 @@ contract OptimisticTaskCoordinatorTest {
         pureVMVerifier = new MockPureVMVerifier();
         pureVMTaskManager = new PureVMTaskManager();
         pureVMChallengeResolver = new PureVMChallengeResolver(address(pureVMTaskManager));
+        pureVMTaskManager.setChallengeResolverAuthorization(address(pureVMChallengeResolver), true);
 
         vm.deal(requester, 100 ether);
         vm.deal(executor, 100 ether);
@@ -165,7 +166,9 @@ contract OptimisticTaskCoordinatorTest {
         _preparePureVMChallengePath();
 
         coordinator = new OptimisticTaskCoordinator(address(validatorManager), address(pureVMChallengeResolver), 1 days);
-        bytes32 taskId = _postTaskWithCoordinator(coordinator, keccak256("claimed-checkpoint"), INITIAL_STATE_ROOT);
+        bytes32 pureVMTaskId = _pureVMTaskId();
+        bytes32 checkpointSummaryHash = pureVMTaskManager.checkpointTaskSummaryHash(pureVMTaskId, 1);
+        bytes32 taskId = _postTaskWithCoordinator(coordinator, checkpointSummaryHash, INITIAL_STATE_ROOT);
 
         vm.prank(executor);
         coordinator.claimTask{value: 2 ether}(taskId);
@@ -175,18 +178,19 @@ contract OptimisticTaskCoordinatorTest {
         coordinator.submitResult(taskId, "ipfs://result", claimedResultHash, bytes32(uint256(0xdead)));
 
         address[] memory selected = coordinator.getSelectedValidators(taskId);
+        PureVMTypes.CheckpointInput memory actualCheckpoint = PureVMTypes.CheckpointInput({
+            stepNumber: 2_918_921,
+            gasUsed: 11_999_998,
+            gasRemaining: 288_000_022,
+            stateRoot: STATE_ROOT_1,
+            snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
+            snapshotURI: "ipfs://snapshot-1"
+        });
         bytes memory challengeData = abi.encode(
             PureVMChallengeResolver.ChallengePayload({
-                pureVMTaskId: _pureVMTaskId(),
+                pureVMTaskId: pureVMTaskId,
                 fromOrdinal: 0,
-                nextCheckpoint: PureVMTypes.CheckpointInput({
-                    stepNumber: 2_918_921,
-                    gasUsed: 11_999_998,
-                    gasRemaining: 288_000_022,
-                    stateRoot: STATE_ROOT_1,
-                    snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
-                    snapshotURI: "ipfs://snapshot-1"
-                }),
+                nextCheckpoint: actualCheckpoint,
                 startSnapshotBytes: SNAPSHOT_BYTES_0,
                 proofBytes: abi.encode(true, STATE_ROOT_1, uint64(2_918_921), TRACE_ROOT_1)
             })
@@ -196,6 +200,111 @@ contract OptimisticTaskCoordinatorTest {
         vm.prank(selected[0]);
         coordinator.challengeResult{value: 0.5 ether}(taskId, challengeData);
         require(requester.balance > requesterBalanceBefore, "requester should be compensated after challenge");
+
+        bytes32 disputeId = pureVMTaskManager.getLatestDisputeForCheckpoint(pureVMTaskId, 0);
+        PureVMTypes.DisputeMeta memory dispute = pureVMTaskManager.getDispute(disputeId);
+        require(dispute.taskId == pureVMTaskId, "dispute task mismatch");
+        require(dispute.challenger == selected[0], "dispute challenger mismatch");
+        require(dispute.challengerWon, "challenge should be recorded as successful");
+        require(
+            dispute.actualResultHash == pureVMTaskManager.checkpointClaimHash(pureVMTaskId, 1, actualCheckpoint),
+            "actual claim hash"
+        );
+        require(dispute.actualStateRoot == STATE_ROOT_1, "actual state root");
+    }
+
+    function testCoordinatorRejectsOversizedInterfaces() public {
+        vm.prank(requester);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OptimisticTaskCoordinator.InterfaceLimitExceeded.selector, "summaryURI", uint256(2_049), uint256(2_048)
+            )
+        );
+        coordinator.postTask{value: 10 ether}(
+            string(new bytes(2_049)),
+            keccak256("summary"),
+            1 days,
+            2,
+            2 ether,
+            OptimisticTaskCoordinator.PayoutConfig({
+                executorRewardBps: 7000,
+                validatorRewardBps: 3000,
+                challengerSlashRewardBps: 4000,
+                requesterSlashBps: 6000,
+                challengeBond: 0.5 ether
+            })
+        );
+
+        bytes32 taskId = _postTask();
+        vm.prank(executor);
+        coordinator.claimTask{value: 2 ether}(taskId);
+
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OptimisticTaskCoordinator.InterfaceLimitExceeded.selector, "resultURI", uint256(2_049), uint256(2_048)
+            )
+        );
+        coordinator.submitResult(taskId, string(new bytes(2_049)), keccak256("result"), keccak256("state-root"));
+
+        vm.prank(executor);
+        coordinator.submitResult(taskId, "ipfs://result", keccak256("result"), keccak256("state-root"));
+        address[] memory selected = coordinator.getSelectedValidators(taskId);
+
+        vm.prank(selected[0]);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OptimisticTaskCoordinator.InterfaceLimitExceeded.selector,
+                "challengeData",
+                uint256(1_320_001),
+                uint256(1_320_000)
+            )
+        );
+        coordinator.challengeResult{value: 0.5 ether}(taskId, new bytes(1_320_001));
+    }
+
+    function testPureVMResolverRejectsOversizedProofPayload() public {
+        _preparePureVMChallengePath();
+
+        coordinator = new OptimisticTaskCoordinator(address(validatorManager), address(pureVMChallengeResolver), 1 days);
+        bytes32 pureVMTaskId = _pureVMTaskId();
+        bytes32 checkpointSummaryHash = pureVMTaskManager.checkpointTaskSummaryHash(pureVMTaskId, 1);
+        bytes32 taskId = _postTaskWithCoordinator(coordinator, checkpointSummaryHash, INITIAL_STATE_ROOT);
+
+        vm.prank(executor);
+        coordinator.claimTask{value: 2 ether}(taskId);
+        vm.prank(executor);
+        coordinator.submitResult(taskId, "ipfs://result", keccak256("bad-checkpoint"), bytes32(uint256(0xdead)));
+
+        address[] memory selected = coordinator.getSelectedValidators(taskId);
+        PureVMTypes.CheckpointInput memory actualCheckpoint = PureVMTypes.CheckpointInput({
+            stepNumber: 2_918_921,
+            gasUsed: 11_999_998,
+            gasRemaining: 288_000_022,
+            stateRoot: STATE_ROOT_1,
+            snapshotBlobHash: keccak256(SNAPSHOT_BYTES_1),
+            snapshotURI: "ipfs://snapshot-1"
+        });
+        bytes memory challengeData = abi.encode(
+            PureVMChallengeResolver.ChallengePayload({
+                pureVMTaskId: pureVMTaskId,
+                fromOrdinal: 0,
+                nextCheckpoint: actualCheckpoint,
+                startSnapshotBytes: SNAPSHOT_BYTES_0,
+                proofBytes: new bytes(1_048_577)
+            })
+        );
+
+        vm.prank(selected[0]);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PureVMChallengeResolver.ChallengePayloadTooLarge.selector,
+                "proofBytes",
+                uint256(1_048_577),
+                uint256(1_048_576)
+            )
+        );
+        coordinator.challengeResult{value: 0.5 ether}(taskId, challengeData);
     }
 
     // _postTask 用统一参数发布一个 optimistic 任务。
@@ -243,19 +352,23 @@ contract OptimisticTaskCoordinatorTest {
     // _pureVMTaskId 用和 createTask 相同的规则计算测试里那条 PureVM task 的 taskId。
     function _pureVMTaskId() internal view returns (bytes32) {
         return pureVMTaskManager.computeTaskId(
-            address(this),
-            0,
-            PUREVM_CODE_HASH,
-            300_000_020,
-            12_000_000,
-            INITIAL_STATE_ROOT
+            address(this), 0, PUREVM_CODE_HASH, 300_000_020, 12_000_000, INITIAL_STATE_ROOT
         );
     }
 }
 
 contract MockPureVMVerifier is IPureVMVerifier {
-    function verifyTransition(
-        bytes calldata,
+    function verifyTransition(bytes calldata, bytes calldata proofBytes, bytes32, uint64, bytes32)
+        external
+        pure
+        override
+        returns (bool valid, bytes32 finalStateRoot, uint64 verifiedSteps, bytes32 traceRoot)
+    {
+        return abi.decode(proofBytes, (bool, bytes32, uint64, bytes32));
+    }
+
+    function verifyTransitionDetailed(
+        bytes calldata startSnapshotBytes,
         bytes calldata proofBytes,
         bytes32,
         uint64,
@@ -264,8 +377,9 @@ contract MockPureVMVerifier is IPureVMVerifier {
         external
         pure
         override
-        returns (bool valid, bytes32 finalStateRoot, uint64 verifiedSteps, bytes32 traceRoot)
+        returns (bool valid, bytes32 initialStateRoot, bytes32 finalStateRoot, uint64 verifiedSteps, bytes32 traceRoot)
     {
-        return abi.decode(proofBytes, (bool, bytes32, uint64, bytes32));
+        (valid, finalStateRoot, verifiedSteps, traceRoot) = abi.decode(proofBytes, (bool, bytes32, uint64, bytes32));
+        initialStateRoot = keccak256(startSnapshotBytes);
     }
 }

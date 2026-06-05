@@ -4,6 +4,8 @@ pragma solidity ^0.8.19;
 import {IPureVMSnapshotStore} from "./interfaces/IPureVMSnapshotStore.sol";
 
 contract PureVMSnapshotStore is IPureVMSnapshotStore {
+    uint256 public constant MAX_SNAPSHOT_BYTES = 262_144;
+
     struct SnapshotBlob {
         address uploader;
         bytes32 blobHash;
@@ -16,21 +18,22 @@ contract PureVMSnapshotStore is IPureVMSnapshotStore {
     error SnapshotAlreadyExists();
     error SnapshotNotFound();
     error UnauthorizedSnapshotDelete();
+    error SnapshotTooLarge(uint256 size, uint256 limit);
 
     event SnapshotUploaded(bytes32 indexed taskId, uint32 indexed ordinal, bytes32 blobHash, uint256 size);
     event SnapshotDeleted(bytes32 indexed taskId, uint32 indexed ordinal, bytes32 blobHash);
 
     function uploadSnapshot(bytes32 taskId, uint32 ordinal, bytes calldata snapshotBytes) external override {
+        if (snapshotBytes.length > MAX_SNAPSHOT_BYTES) {
+            revert SnapshotTooLarge(snapshotBytes.length, MAX_SNAPSHOT_BYTES);
+        }
+
         SnapshotBlob storage blob = blobs[taskId][ordinal];
         if (blob.exists) revert SnapshotAlreadyExists();
 
         bytes32 blobHash = keccak256(snapshotBytes);
-        blobs[taskId][ordinal] = SnapshotBlob({
-            uploader: msg.sender,
-            blobHash: blobHash,
-            data: snapshotBytes,
-            exists: true
-        });
+        blobs[taskId][ordinal] =
+            SnapshotBlob({uploader: msg.sender, blobHash: blobHash, data: snapshotBytes, exists: true});
 
         emit SnapshotUploaded(taskId, ordinal, blobHash, snapshotBytes.length);
     }

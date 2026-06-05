@@ -23,20 +23,20 @@ type TransitionProof struct {
 
 // StepProof 记录单步执行前后可验证的信息。
 type StepProof struct {
-	Index           uint64        `json:"index"`
-	PC              uint64        `json:"pc"`
-	OpCode          byte          `json:"opcode"`
-	GasBefore       uint64        `json:"gas_before"`
-	GasCost         uint64        `json:"gas_cost"`
-	GasAfter        uint64        `json:"gas_after"`
-	StackBeforeSize int           `json:"stack_before_size"`
-	StackAfterSize  int           `json:"stack_after_size"`
-	StackPopped     []core.Word   `json:"stack_popped,omitempty"`
-	StackPushed     []core.Word   `json:"stack_pushed,omitempty"`
-	MemRead         []MemAccess   `json:"mem_read,omitempty"`
-	MemWrite        []MemAccess   `json:"mem_write,omitempty"`
-	StateHashBefore common.Hash   `json:"state_hash_before"`
-	StateHashAfter  common.Hash   `json:"state_hash_after"`
+	Index           uint64      `json:"index"`
+	PC              uint64      `json:"pc"`
+	OpCode          byte        `json:"opcode"`
+	GasBefore       uint64      `json:"gas_before"`
+	GasCost         uint64      `json:"gas_cost"`
+	GasAfter        uint64      `json:"gas_after"`
+	StackBeforeSize int         `json:"stack_before_size"`
+	StackAfterSize  int         `json:"stack_after_size"`
+	StackPopped     []core.Word `json:"stack_popped,omitempty"`
+	StackPushed     []core.Word `json:"stack_pushed,omitempty"`
+	MemRead         []MemAccess `json:"mem_read,omitempty"`
+	MemWrite        []MemAccess `json:"mem_write,omitempty"`
+	StateHashBefore common.Hash `json:"state_hash_before"`
+	StateHashAfter  common.Hash `json:"state_hash_after"`
 }
 
 type MemAccess struct {
@@ -219,6 +219,15 @@ func (p *TransitionProof) Verify(initialState *core.VMState) error {
 	if initialState.CodeHash != p.CodeHash {
 		return fmt.Errorf("code hash mismatch")
 	}
+	if err := initialState.VerifyCodeHash(); err != nil {
+		return err
+	}
+	if initialState.StepCount != p.StartStep {
+		return fmt.Errorf("start step mismatch: have %d, want %d", initialState.StepCount, p.StartStep)
+	}
+	if p.EndStep < p.StartStep {
+		return fmt.Errorf("invalid proof step range: start=%d end=%d", p.StartStep, p.EndStep)
+	}
 	if CalculateTraceRoot(p.Steps) != p.TraceRoot {
 		return fmt.Errorf("trace root mismatch")
 	}
@@ -228,6 +237,9 @@ func (p *TransitionProof) Verify(initialState *core.VMState) error {
 
 	totalGas := uint64(0)
 	for i, step := range p.Steps {
+		if step.Index != vm.State.StepCount {
+			return fmt.Errorf("step index mismatch at proof step %d: have %d, want %d", i, step.Index, vm.State.StepCount)
+		}
 		if vm.State.Hash() != step.StateHashBefore {
 			return fmt.Errorf("pre-state hash mismatch at step %d", i)
 		}

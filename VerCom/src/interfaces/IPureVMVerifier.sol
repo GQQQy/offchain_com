@@ -8,8 +8,16 @@ interface IPureVMVerifier {
         bytes32 expectedFinalStateRoot,
         uint64 expectedVerifiedSteps,
         bytes32 expectedTraceRoot
+    ) external view returns (bool valid, bytes32 finalStateRoot, uint64 verifiedSteps, bytes32 traceRoot);
+
+    function verifyTransitionDetailed(
+        bytes calldata startSnapshotBytes,
+        bytes calldata proofBytes,
+        bytes32 expectedFinalStateRoot,
+        uint64 expectedVerifiedSteps,
+        bytes32 expectedTraceRoot
     )
         external
         view
-        returns (bool valid, bytes32 finalStateRoot, uint64 verifiedSteps, bytes32 traceRoot);
+        returns (bool valid, bytes32 initialStateRoot, bytes32 finalStateRoot, uint64 verifiedSteps, bytes32 traceRoot);
 }

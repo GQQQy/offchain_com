@@ -1,9 +1,12 @@
 package core
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -28,6 +31,92 @@ type VMState struct {
 	// 可选上下文（用于复杂场景）
 	CallValue *big.Int `json:"call_value,omitempty"`
 	CallData  []byte   `json:"call_data,omitempty"`
+}
+
+type vmStateJSON struct {
+	PC        uint64      `json:"pc"`
+	Stack     []Word      `json:"stack"`
+	Memory    string      `json:"memory"`
+	Gas       uint64      `json:"gas"`
+	Refund    uint64      `json:"refund"`
+	Code      string      `json:"code"`
+	CodeHash  common.Hash `json:"code_hash"`
+	StepCount uint64      `json:"step_count"`
+	CallValue *big.Int    `json:"call_value,omitempty"`
+	CallData  *string     `json:"call_data,omitempty"`
+}
+
+type vmStateRawJSON struct {
+	PC        uint64          `json:"pc"`
+	Stack     []Word          `json:"stack"`
+	Memory    json.RawMessage `json:"memory"`
+	Gas       uint64          `json:"gas"`
+	Refund    uint64          `json:"refund"`
+	Code      json.RawMessage `json:"code"`
+	CodeHash  common.Hash     `json:"code_hash"`
+	StepCount uint64          `json:"step_count"`
+	CallValue *big.Int        `json:"call_value,omitempty"`
+	CallData  json.RawMessage `json:"call_data,omitempty"`
+}
+
+// MarshalJSON uses explicit 0x-prefixed hex for byte slices.
+// Go's default []byte JSON is base64, which is hard for Solidity/Foundry scripts
+// to parse as bytes and made snapshot artifacts ambiguous.
+func (s VMState) MarshalJSON() ([]byte, error) {
+	var callData *string
+	if len(s.CallData) > 0 {
+		encoded := encodeHexBytes(s.CallData)
+		callData = &encoded
+	}
+
+	return json.Marshal(vmStateJSON{
+		PC:        s.PC,
+		Stack:     s.Stack,
+		Memory:    encodeHexBytes(s.Memory),
+		Gas:       s.Gas,
+		Refund:    s.Refund,
+		Code:      encodeHexBytes(s.Code),
+		CodeHash:  s.CodeHash,
+		StepCount: s.StepCount,
+		CallValue: s.CallValue,
+		CallData:  callData,
+	})
+}
+
+// UnmarshalJSON accepts both the current 0x-hex form and legacy Go base64
+// []byte JSON, so old local artifacts can still be inspected and verified.
+func (s *VMState) UnmarshalJSON(data []byte) error {
+	var raw vmStateRawJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	memory, err := decodeByteField(raw.Memory)
+	if err != nil {
+		return fmt.Errorf("decode memory: %w", err)
+	}
+	code, err := decodeByteField(raw.Code)
+	if err != nil {
+		return fmt.Errorf("decode code: %w", err)
+	}
+	callData, err := decodeOptionalByteField(raw.CallData)
+	if err != nil {
+		return fmt.Errorf("decode call_data: %w", err)
+	}
+
+	*s = VMState{
+		PC:        raw.PC,
+		Stack:     raw.Stack,
+		Memory:    memory,
+		Gas:       raw.Gas,
+		Refund:    raw.Refund,
+		Code:      code,
+		CodeHash:  raw.CodeHash,
+		StepCount: raw.StepCount,
+		CallValue: raw.CallValue,
+		CallData:  callData,
+	}
+	return nil
 }
 
 // NewState 创建初始状态
@@ -81,6 +170,15 @@ func (s *VMState) Hash() common.Hash {
 	return crypto.Keccak256Hash(s.SerializeCanonical())
 }
 
+// VerifyCodeHash checks that the executable bytecode matches the committed code hash.
+func (s *VMState) VerifyCodeHash() error {
+	actual := crypto.Keccak256Hash(s.Code)
+	if actual != s.CodeHash {
+		return fmt.Errorf("code hash mismatch: calculated %s, state claims %s", actual.Hex(), s.CodeHash.Hex())
+	}
+	return nil
+}
+
 // Clone 深拷贝状态（用于快照）
 func (s *VMState) Clone() *VMState {
 	newState := &VMState{
@@ -92,7 +190,6 @@ func (s *VMState) Clone() *VMState {
 		Code:      make([]byte, len(s.Code)),
 		CodeHash:  s.CodeHash,
 		StepCount: s.StepCount,
-		CallValue: new(big.Int),
 		CallData:  make([]byte, len(s.CallData)),
 	}
 
@@ -100,7 +197,7 @@ func (s *VMState) Clone() *VMState {
 	copy(newState.Memory, s.Memory)
 	copy(newState.Code, s.Code)
 	if s.CallValue != nil {
-		newState.CallValue.Set(s.CallValue)
+		newState.CallValue = new(big.Int).Set(s.CallValue)
 	}
 	copy(newState.CallData, s.CallData)
 
@@ -163,4 +260,65 @@ func (s *VMState) StackPeek() (Word, error) {
 // GetStackDepth 获取当前栈深度
 func (s *VMState) GetStackDepth() int {
 	return len(s.Stack)
+}
+
+func encodeHexBytes(b []byte) string {
+	return "0x" + common.Bytes2Hex(b)
+}
+
+func decodeOptionalByteField(raw json.RawMessage) ([]byte, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	return decodeByteField(raw)
+}
+
+func decodeByteField(raw json.RawMessage) ([]byte, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+
+	var encoded string
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		return nil, err
+	}
+	if encoded == "" {
+		return []byte{}, nil
+	}
+
+	if strings.HasPrefix(encoded, "0x") || strings.HasPrefix(encoded, "0X") {
+		hexValue := encoded[2:]
+		if len(hexValue)%2 == 1 {
+			hexValue = "0" + hexValue
+		}
+		decoded, err := hex.DecodeString(hexValue)
+		if err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	}
+
+	if looksLikeHex(encoded) {
+		if len(encoded)%2 == 1 {
+			encoded = "0" + encoded
+		}
+		return hex.DecodeString(encoded)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err == nil {
+		return decoded, nil
+	}
+
+	return nil, err
+}
+
+func looksLikeHex(s string) bool {
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }

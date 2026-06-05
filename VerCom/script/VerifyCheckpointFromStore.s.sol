@@ -39,12 +39,7 @@ contract VerifyCheckpointFromStoreScript {
 
         vm.startBroadcast();
         bool ok = manager.verifyAndAppendCheckpointFromStore(
-            taskId,
-            fromOrdinal,
-            snapshotStore,
-            nextCheckpoint,
-            proofBytes,
-            proofURI
+            taskId, fromOrdinal, snapshotStore, nextCheckpoint, proofBytes, proofURI
         );
         vm.stopBroadcast();
         return ok;

@@ -6,6 +6,8 @@ import {ValidatorManager} from "./ValidatorManager.sol";
 
 contract OptimisticTaskCoordinator {
     uint16 internal constant BPS = 10_000;
+    uint256 public constant MAX_URI_BYTES = 2_048;
+    uint256 public constant MAX_CHALLENGE_DATA_BYTES = 1_320_000;
 
     enum TaskStatus {
         Open,
@@ -78,6 +80,7 @@ contract OptimisticTaskCoordinator {
     error ChallengeAlreadyResolved();
     error ChallengeFailed();
     error AlreadyResolved();
+    error InterfaceLimitExceeded(string field, uint256 size, uint256 limit);
 
     event TaskPosted(
         bytes32 indexed taskId,
@@ -89,7 +92,9 @@ contract OptimisticTaskCoordinator {
         uint256 executorBondRequired
     );
     event TaskClaimed(bytes32 indexed taskId, address indexed executor, uint256 bondPosted);
-    event ResultSubmitted(bytes32 indexed taskId, bytes32 indexed resultHash, bytes32 claimedStateRoot, uint64 challengeDeadline);
+    event ResultSubmitted(
+        bytes32 indexed taskId, bytes32 indexed resultHash, bytes32 claimedStateRoot, uint64 challengeDeadline
+    );
     event ValidatorsSelected(bytes32 indexed taskId, address[] validators);
     event ResultAttested(bytes32 indexed taskId, address indexed validator);
     event ChallengeSucceeded(
@@ -109,11 +114,7 @@ contract OptimisticTaskCoordinator {
         uint256 requesterRefund
     );
 
-    constructor(
-        address validatorManager_,
-        address challengeResolver_,
-        uint64 defaultChallengeWindow_
-    ) {
+    constructor(address validatorManager_, address challengeResolver_, uint64 defaultChallengeWindow_) {
         validatorManager = ValidatorManager(validatorManager_);
         challengeResolver = IOptimisticChallengeResolver(challengeResolver_);
         defaultChallengeWindow = defaultChallengeWindow_;
@@ -130,6 +131,7 @@ contract OptimisticTaskCoordinator {
         if (msg.value == 0) revert RewardRequired();
         if (executionWindow == 0) revert InvalidWindow();
         if (validatorCount == 0) revert InvalidValidatorCount();
+        _validateUri("summaryURI", summaryURI);
         _validatePayoutConfig(payoutConfig);
 
         uint256 nonce = requesterNonces[msg.sender]++;
@@ -174,7 +176,15 @@ contract OptimisticTaskCoordinator {
             challenger: address(0)
         });
 
-        emit TaskPosted(taskId, msg.sender, summaryHash, uint64(block.timestamp + executionWindow), validatorCount, msg.value, executorBondRequired);
+        emit TaskPosted(
+            taskId,
+            msg.sender,
+            summaryHash,
+            uint64(block.timestamp + executionWindow),
+            validatorCount,
+            msg.value,
+            executorBondRequired
+        );
     }
 
     function claimTask(bytes32 taskId) external payable {
@@ -190,11 +200,14 @@ contract OptimisticTaskCoordinator {
         emit TaskClaimed(taskId, msg.sender, msg.value);
     }
 
-    function submitResult(bytes32 taskId, string calldata resultURI, bytes32 resultHash, bytes32 claimedStateRoot) external {
+    function submitResult(bytes32 taskId, string calldata resultURI, bytes32 resultHash, bytes32 claimedStateRoot)
+        external
+    {
         TaskConfig storage task = tasks[taskId];
         if (task.status != TaskStatus.Claimed) revert InvalidTask();
         if (msg.sender != task.executor) revert OnlyExecutor();
         if (block.timestamp > task.executionDeadline) revert ExecutionDeadlinePassed();
+        _validateUri("resultURI", resultURI);
 
         task.resultURI = resultURI;
         task.resultHash = resultHash;
@@ -205,8 +218,7 @@ contract OptimisticTaskCoordinator {
         emit ResultSubmitted(taskId, resultHash, claimedStateRoot, task.challengeDeadline);
 
         address[] memory validators = validatorManager.selectValidators(
-            keccak256(abi.encode(taskId, resultHash, block.prevrandao)),
-            task.validatorCount
+            keccak256(abi.encode(taskId, resultHash, block.prevrandao)), task.validatorCount
         );
         for (uint256 i = 0; i < validators.length; i++) {
             selectedValidators[taskId].push(validators[i]);
@@ -228,6 +240,10 @@ contract OptimisticTaskCoordinator {
     }
 
     function challengeResult(bytes32 taskId, bytes calldata challengeData) external payable returns (bool) {
+        if (challengeData.length > MAX_CHALLENGE_DATA_BYTES) {
+            revert InterfaceLimitExceeded("challengeData", challengeData.length, MAX_CHALLENGE_DATA_BYTES);
+        }
+
         TaskConfig storage task = tasks[taskId];
         if (task.status != TaskStatus.ResultSubmitted) revert ResultNotSubmitted();
         if (block.timestamp > task.challengeDeadline) revert ChallengeWindowClosed();
@@ -235,7 +251,7 @@ contract OptimisticTaskCoordinator {
         if (msg.value < task.challengeBond) revert ChallengeBondTooSmall();
 
         (bool success, bytes32 actualResultHash, bytes32 actualStateRoot) = challengeResolver.validateChallenge(
-            taskId, task.summaryHash, task.resultHash, task.claimedStateRoot, challengeData
+            msg.sender, taskId, task.summaryHash, task.resultHash, task.claimedStateRoot, challengeData
         );
 
         if (!success) {
@@ -262,12 +278,7 @@ contract OptimisticTaskCoordinator {
         require(okRequester, "requester payout failed");
 
         emit ChallengeSucceeded(
-            taskId,
-            msg.sender,
-            actualResultHash,
-            actualStateRoot,
-            challengerReward,
-            requesterCompensation
+            taskId, msg.sender, actualResultHash, actualStateRoot, challengerReward, requesterCompensation
         );
         return true;
     }
@@ -326,5 +337,10 @@ contract OptimisticTaskCoordinator {
     function _validatePayoutConfig(PayoutConfig memory config) internal pure {
         if (config.executorRewardBps + config.validatorRewardBps > BPS) revert InvalidPayoutConfig();
         if (config.challengerSlashRewardBps + config.requesterSlashBps != BPS) revert InvalidPayoutConfig();
+    }
+
+    function _validateUri(string memory field, string memory uri) internal pure {
+        uint256 size = bytes(uri).length;
+        if (size > MAX_URI_BYTES) revert InterfaceLimitExceeded(field, size, MAX_URI_BYTES);
     }
 }

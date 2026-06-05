@@ -37,6 +37,7 @@ contract DeployVerComScript {
         verifierAdapter = new PureVMVerifierAdapter(verifierTarget);
         taskManager = new PureVMTaskManager();
         challengeResolver = new PureVMChallengeResolver(address(taskManager));
+        taskManager.setChallengeResolverAuthorization(address(challengeResolver), true);
         coordinator = new OptimisticTaskCoordinator(address(validatorManager), address(challengeResolver), 1 days);
         vm.stopBroadcast();
     }

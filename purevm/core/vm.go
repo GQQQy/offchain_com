@@ -171,10 +171,8 @@ func (vm *VM) CreateSnapshot(chainID uint64) *StandardSnapshot {
 
 // LoadSnapshot 从快照恢复（用于链上验证）
 func (vm *VM) LoadSnapshot(snap *StandardSnapshot) error {
-	// 验证哈希
-	calcHash := snap.State.Hash()
-	if calcHash != snap.Header.StateRoot {
-		return fmt.Errorf("snapshot hash mismatch: calc %s, want %s", calcHash.Hex(), snap.Header.StateRoot.Hex())
+	if err := snap.VerifyIntegrity(); err != nil {
+		return fmt.Errorf("snapshot integrity check failed: %w", err)
 	}
 
 	vm.State = snap.State.Clone()

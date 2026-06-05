@@ -1,15 +1,19 @@
 package test
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"testing"
 
 	"purevm/core"
+	"purevm/precompile"
 	"purevm/proof"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestArithmeticWithSnapshot 验证最基础的“执行 -> 生成快照 -> 快照序列化”闭环。
@@ -42,6 +46,86 @@ func TestArithmeticWithSnapshot(t *testing.T) {
 	var snap2 core.StandardSnapshot
 	json.Unmarshal(data, &snap2)
 	assert.Equal(t, snap.Header.StateRoot, snap2.Header.StateRoot)
+}
+
+// TestSnapshotJSONUsesHexBytes 确认快照 JSON 中的 bytes 字段是 Foundry 可直接 parseJsonBytes 的 0x hex。
+func TestSnapshotJSONUsesHexBytes(t *testing.T) {
+	state := core.NewState([]byte{0x60, 0x01, 0x00}, 100000)
+	state.Memory = []byte{0xab, 0xcd}
+	snap := core.NewStandardSnapshot(state, 1337)
+
+	data, err := json.Marshal(snap)
+	assert.NoError(t, err)
+
+	var raw map[string]any
+	assert.NoError(t, json.Unmarshal(data, &raw))
+	stateRaw := raw["state"].(map[string]any)
+	assert.Equal(t, "0x600100", stateRaw["code"])
+	assert.Equal(t, "0xabcd", stateRaw["memory"])
+
+	var decoded core.StandardSnapshot
+	assert.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, snap.State.Code, decoded.State.Code)
+	assert.Equal(t, snap.State.Memory, decoded.State.Memory)
+	assert.NoError(t, decoded.VerifyIntegrity())
+}
+
+// TestSnapshotIntegrityRejectsCodeTamper 验证快照恢复会检查实际 code 和 code_hash 的绑定。
+func TestSnapshotIntegrityRejectsCodeTamper(t *testing.T) {
+	state := core.NewState([]byte{0x60, 0x01, 0x00}, 100000)
+	snap := core.NewStandardSnapshot(state, 1337)
+	assert.NoError(t, snap.VerifyIntegrity())
+
+	snap.State.Code[1] = 0x02
+	assert.Error(t, snap.VerifyIntegrity())
+}
+
+// TestPrecompileAcceptsFullSnapshot 验证本地预编译路径可以直接接收完整 StandardSnapshot JSON。
+func TestPrecompileAcceptsFullSnapshot(t *testing.T) {
+	code := []byte{0x60, 0x01, 0x60, 0x02, 0x01, 0x00}
+	vm := core.NewVM(code, 100000)
+	snap := core.NewStandardSnapshot(vm.State, 1337)
+
+	p, err := proof.GenerateTransitionProof(vm, 3)
+	assert.NoError(t, err)
+	assert.NoError(t, p.Verify(&snap.State))
+
+	snapshotBytes, err := json.Marshal(snap)
+	assert.NoError(t, err)
+	proofBytes, err := json.Marshal(p)
+	assert.NoError(t, err)
+
+	input := make([]byte, 8, 8+len(snapshotBytes)+len(proofBytes))
+	binary.BigEndian.PutUint32(input[:4], uint32(len(snapshotBytes)))
+	binary.BigEndian.PutUint32(input[4:8], uint32(len(proofBytes)))
+	input = append(input, snapshotBytes...)
+	input = append(input, proofBytes...)
+
+	validator := precompile.SnapshotValidatorPrecompile{}
+	out, err := validator.Run(input)
+	assert.NoError(t, err)
+	assert.Len(t, out, 128)
+	assert.Equal(t, byte(1), out[31])
+	assert.Equal(t, p.FinalHash, common.BytesToHash(out[32:64]))
+	assert.Equal(t, uint64(3), binary.BigEndian.Uint64(out[88:96]))
+	assert.Equal(t, p.TraceRoot, common.BytesToHash(out[96:128]))
+}
+
+// TestPrecompileRejectsOversizedPayloads 验证本地预编译和合约 adapter 使用相同的输入上限。
+func TestPrecompileRejectsOversizedPayloads(t *testing.T) {
+	validator := precompile.SnapshotValidatorPrecompile{}
+
+	input := make([]byte, 8)
+	binary.BigEndian.PutUint32(input[:4], uint32(precompile.MaxSnapshotBytes+1))
+	binary.BigEndian.PutUint32(input[4:8], 0)
+	_, err := validator.Run(input)
+	assert.Error(t, err)
+
+	input = make([]byte, 8)
+	binary.BigEndian.PutUint32(input[:4], 0)
+	binary.BigEndian.PutUint32(input[4:8], uint32(precompile.MaxProofBytes+1))
+	_, err = validator.Run(input)
+	assert.Error(t, err)
 }
 
 // TestTransitionProof 验证短区间状态转移证明能生成且能被重放验证。
@@ -244,4 +328,36 @@ func TestSnapshotIndexThresholdValidation(t *testing.T) {
 	bad.GasUsed = 501
 	err = idx.ValidateAdjacentThreshold(&idx.Snapshots[0], &bad)
 	assert.Error(t, err)
+}
+
+// TestFindFirstDivergentSegment 验证第一层承诺序列定位能找出最早分歧段。
+func TestFindFirstDivergentSegment(t *testing.T) {
+	claimed := core.NewSnapshotIndex(1337, 3000, 500)
+	verified := core.NewSnapshotIndex(1337, 3000, 500)
+
+	root0 := common.HexToHash("0x01")
+	root1 := common.HexToHash("0x02")
+	claimedBadRoot2 := common.HexToHash("0x03")
+	verifiedRoot2 := common.HexToHash("0x04")
+
+	claimed.Snapshots = []core.SnapshotIndexEntry{
+		{Ordinal: 0, StepNumber: 0, GasUsed: 0, StateRoot: root0},
+		{Ordinal: 1, StepNumber: 10, GasUsed: 500, StateRoot: root1},
+		{Ordinal: 2, StepNumber: 20, GasUsed: 1000, StateRoot: claimedBadRoot2},
+	}
+	verified.Snapshots = []core.SnapshotIndexEntry{
+		{Ordinal: 0, StepNumber: 0, GasUsed: 0, StateRoot: root0},
+		{Ordinal: 1, StepNumber: 10, GasUsed: 500, StateRoot: root1},
+		{Ordinal: 2, StepNumber: 20, GasUsed: 1000, StateRoot: verifiedRoot2},
+	}
+
+	divergence, err := proof.FindFirstDivergentSegment(claimed, verified)
+	assert.NoError(t, err)
+	require.NotNil(t, divergence)
+	assert.True(t, divergence.Found)
+	assert.Equal(t, 1, divergence.FromOrdinal)
+	assert.Equal(t, 2, divergence.ToOrdinal)
+	assert.Equal(t, root1, divergence.SharedStartRoot)
+	assert.Equal(t, claimedBadRoot2, divergence.ClaimedNextRoot)
+	assert.Equal(t, verifiedRoot2, divergence.VerifiedNextRoot)
 }

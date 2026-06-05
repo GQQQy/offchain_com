@@ -15,6 +15,7 @@ Desktop.ini
 # Root local artifacts
 .tmp/
 .cache/
+.pdf_deps/
 **/.tmp/
 **/.cache/
 

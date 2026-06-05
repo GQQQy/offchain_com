@@ -61,6 +61,15 @@ contract RunPureVMChallengeE2EScript {
         uint256 executorPk = vm.envUint("EXECUTOR_PRIVATE_KEY");
         uint256 validatorPk = vm.envUint("VALIDATOR_PRIVATE_KEY");
 
+        PureVMTypes.CheckpointInput memory nextCheckpoint = PureVMTypes.CheckpointInput({
+            stepNumber: uint64(_indexUint(indexJson, fromOrdinalUint + 1, ".step_number")),
+            gasUsed: uint64(_indexUint(indexJson, fromOrdinalUint + 1, ".gas_used")),
+            gasRemaining: uint64(_indexUint(indexJson, fromOrdinalUint + 1, ".gas_remaining")),
+            stateRoot: _indexBytes32(indexJson, fromOrdinalUint + 1, ".state_root"),
+            snapshotBlobHash: keccak256(nextSnapshotBytes),
+            snapshotURI: string.concat("file://", nextSnapshotFile)
+        });
+
         vm.startBroadcast(requesterPk);
         pureVMTaskId = taskManager.createTask(
             PureVMTypes.TaskCreation({
@@ -75,9 +84,10 @@ contract RunPureVMChallengeE2EScript {
             })
         );
 
+        bytes32 checkpointSummaryHash = taskManager.checkpointTaskSummaryHash(pureVMTaskId, fromOrdinal + 1);
         optimisticTaskId = coordinator.postTask{value: vm.envUint("OPTIMISTIC_REWARD_POOL")}(
             vm.envString("OPTIMISTIC_SUMMARY_URI"),
-            keccak256(bytes(vm.envString("OPTIMISTIC_SUMMARY_URI"))),
+            checkpointSummaryHash,
             uint64(vm.envUint("OPTIMISTIC_EXECUTION_WINDOW")),
             uint32(vm.envUint("OPTIMISTIC_VALIDATOR_COUNT")),
             vm.envUint("OPTIMISTIC_EXECUTOR_BOND"),
@@ -97,22 +107,21 @@ contract RunPureVMChallengeE2EScript {
 
         vm.startBroadcast(executorPk);
         coordinator.claimTask{value: vm.envUint("OPTIMISTIC_EXECUTOR_BOND")}(optimisticTaskId);
+        PureVMTypes.CheckpointInput memory badClaimedCheckpoint = PureVMTypes.CheckpointInput({
+            stepNumber: nextCheckpoint.stepNumber,
+            gasUsed: nextCheckpoint.gasUsed,
+            gasRemaining: nextCheckpoint.gasRemaining,
+            stateRoot: bytes32(uint256(0xdead)),
+            snapshotBlobHash: keccak256(bytes("bad-snapshot")),
+            snapshotURI: vm.envString("OPTIMISTIC_RESULT_URI")
+        });
         coordinator.submitResult(
             optimisticTaskId,
             vm.envString("OPTIMISTIC_RESULT_URI"),
-            keccak256(bytes("bad-result")),
-            bytes32(uint256(0xdead))
+            taskManager.checkpointClaimHash(pureVMTaskId, fromOrdinal + 1, badClaimedCheckpoint),
+            badClaimedCheckpoint.stateRoot
         );
         vm.stopBroadcast();
-
-        PureVMTypes.CheckpointInput memory nextCheckpoint = PureVMTypes.CheckpointInput({
-            stepNumber: uint64(_indexUint(indexJson, fromOrdinalUint + 1, ".step_number")),
-            gasUsed: uint64(_indexUint(indexJson, fromOrdinalUint + 1, ".gas_used")),
-            gasRemaining: uint64(_indexUint(indexJson, fromOrdinalUint + 1, ".gas_remaining")),
-            stateRoot: _indexBytes32(indexJson, fromOrdinalUint + 1, ".state_root"),
-            snapshotBlobHash: keccak256(nextSnapshotBytes),
-            snapshotURI: string.concat("file://", nextSnapshotFile)
-        });
 
         bytes memory challengeData = abi.encode(
             PureVMChallengeResolver.ChallengePayload({
@@ -131,15 +140,27 @@ contract RunPureVMChallengeE2EScript {
         challengeResolver;
     }
 
-    function _indexString(string memory indexJson, uint256 ordinal, string memory suffix) internal pure returns (string memory) {
+    function _indexString(string memory indexJson, uint256 ordinal, string memory suffix)
+        internal
+        pure
+        returns (string memory)
+    {
         return vm.parseJsonString(indexJson, string.concat(".snapshots[", vm.toString(ordinal), "]", suffix));
     }
 
-    function _indexUint(string memory indexJson, uint256 ordinal, string memory suffix) internal pure returns (uint256) {
+    function _indexUint(string memory indexJson, uint256 ordinal, string memory suffix)
+        internal
+        pure
+        returns (uint256)
+    {
         return vm.parseJsonUint(indexJson, string.concat(".snapshots[", vm.toString(ordinal), "]", suffix));
     }
 
-    function _indexBytes32(string memory indexJson, uint256 ordinal, string memory suffix) internal pure returns (bytes32) {
+    function _indexBytes32(string memory indexJson, uint256 ordinal, string memory suffix)
+        internal
+        pure
+        returns (bytes32)
+    {
         return vm.parseJsonBytes32(indexJson, string.concat(".snapshots[", vm.toString(ordinal), "]", suffix));
     }
 }
