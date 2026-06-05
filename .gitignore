@@ -26,12 +26,13 @@ Desktop.ini
 
 # Go binaries / test binaries
 **/*.test
-**/vmcli
-**/vmcli.exe
+purevm/vmcli
+purevm/cmd/vmcli/vmcli
 **/*.exe
 
 # Generated long-run artifacts
 **/testdata/long_run_artifacts/
+**/testdata/e2e_artifacts/
 
 # Foundry / Solidity build outputs
 **/cache/
@@ -39,5 +40,5 @@ Desktop.ini
 **/broadcast/
 **/.svm/
 
-# Solidity docs
-**/docs/
+# Generated Solidity docs
+VerCom/docs/

@@ -63,6 +63,7 @@ contract OptimisticTaskCoordinatorTest {
         coordinator = new OptimisticTaskCoordinator(address(validatorManager), address(mockChallengeResolver), 1 days);
         pureVMVerifier = new MockPureVMVerifier();
         pureVMTaskManager = new PureVMTaskManager();
+        pureVMTaskManager.setVerifierApproval(address(pureVMVerifier), 1, true);
         pureVMChallengeResolver = new PureVMChallengeResolver(address(pureVMTaskManager));
         pureVMTaskManager.setChallengeResolverAuthorization(address(pureVMChallengeResolver), true);
 
@@ -138,6 +139,103 @@ contract OptimisticTaskCoordinatorTest {
 
         require(challenger.balance > challengerBalanceBefore, "challenger should receive reward");
         require(requester.balance > requesterBalanceBefore, "requester should receive compensation");
+    }
+
+    function testRequesterCanCancelUnclaimedExpiredTask() public {
+        bytes32 taskId = _postTask();
+        uint256 requesterBalanceBefore = requester.balance;
+
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.prank(requester);
+        coordinator.cancelExpiredTask(taskId);
+
+        OptimisticTaskCoordinator.TaskConfig memory task = coordinator.getTask(taskId);
+        require(task.status == OptimisticTaskCoordinator.TaskStatus.Cancelled, "task cancelled");
+        require(task.rewardPool == 0, "reward cleared");
+        require(requester.balance > requesterBalanceBefore, "requester refunded");
+    }
+
+    function testRequesterCanCancelClaimedExpiredTaskAndReceiveExecutorBond() public {
+        bytes32 taskId = _postTask();
+        vm.prank(executor);
+        coordinator.claimTask{value: 2 ether}(taskId);
+        uint256 requesterBalanceBefore = requester.balance;
+
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.prank(requester);
+        coordinator.cancelExpiredTask(taskId);
+
+        OptimisticTaskCoordinator.TaskConfig memory task = coordinator.getTask(taskId);
+        require(task.status == OptimisticTaskCoordinator.TaskStatus.Cancelled, "task cancelled");
+        require(task.executorBondPosted == 0, "bond cleared");
+        require(requester.balance >= requesterBalanceBefore + 12 ether, "requester receives reward and bond");
+    }
+
+    function testAttestationThresholdBlocksFinalizeUntilEnoughValidatorsAttest() public {
+        bytes32 taskId = _postTaskWithThreshold(2);
+        vm.prank(executor);
+        coordinator.claimTask{value: 2 ether}(taskId);
+        vm.prank(executor);
+        coordinator.submitResult(taskId, "ipfs://result", keccak256("result"), keccak256("state-root"));
+
+        address[] memory selected = coordinator.getSelectedValidators(taskId);
+        vm.prank(selected[0]);
+        coordinator.attestResult(taskId);
+
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OptimisticTaskCoordinator.AttestationThresholdNotMet.selector, uint256(1), uint256(2)
+            )
+        );
+        coordinator.finalizeTask(taskId);
+
+        vm.prank(selected[1]);
+        vm.expectRevert(abi.encodeWithSelector(OptimisticTaskCoordinator.ChallengeWindowClosed.selector));
+        coordinator.attestResult(taskId);
+
+        uint256 requesterBalanceBefore = requester.balance;
+        vm.prank(requester);
+        coordinator.cancelUnderAttestedTask(taskId);
+        OptimisticTaskCoordinator.TaskConfig memory task = coordinator.getTask(taskId);
+        require(task.status == OptimisticTaskCoordinator.TaskStatus.Cancelled, "under-attested task cancelled");
+        require(requester.balance > requesterBalanceBefore, "requester gets reward back");
+    }
+
+    function testPureVMCheckpointTaskRecordsBindingAndRequiresArtifactManifest() public {
+        bytes32 pureVMTaskId = keccak256("purevm-task");
+        uint32 checkpointOrdinal = 3;
+        bytes32 taskId = _postPureVMCheckpointTask(pureVMTaskId, checkpointOrdinal);
+
+        (bytes32 storedTaskId, uint32 storedOrdinal, bool exists) = coordinator.pureVMCheckpointBindings(taskId);
+        require(exists, "binding exists");
+        require(storedTaskId == pureVMTaskId, "purevm task binding");
+        require(storedOrdinal == checkpointOrdinal, "checkpoint ordinal binding");
+
+        OptimisticTaskCoordinator.TaskConfig memory task = coordinator.getTask(taskId);
+        require(task.summaryHash == coordinator.checkpointTaskSummaryHash(pureVMTaskId, checkpointOrdinal), "summary");
+
+        vm.prank(executor);
+        coordinator.claimTask{value: 2 ether}(taskId);
+
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OptimisticTaskCoordinator.ArtifactManifestRequired.selector));
+        coordinator.submitResult(taskId, "ipfs://result", keccak256("result"), keccak256("state-root"));
+
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OptimisticTaskCoordinator.ArtifactManifestRequired.selector));
+        coordinator.submitPureVMCheckpointResult(
+            taskId, "ipfs://result", keccak256("result"), keccak256("state-root"), bytes32(0), "ipfs://manifest"
+        );
+
+        bytes32 manifestHash = keccak256("artifact-manifest");
+        vm.prank(executor);
+        coordinator.submitPureVMCheckpointResult(
+            taskId, "ipfs://result", keccak256("result"), keccak256("state-root"), manifestHash, "ipfs://manifest"
+        );
+        task = coordinator.getTask(taskId);
+        require(task.artifactManifestSubmitted, "manifest submitted");
+        require(task.artifactManifestHash == manifestHash, "manifest hash");
     }
 
     // testUnselectedValidatorCannotChallenge 验证只有被随机选中的验证者才能发起挑战。
@@ -310,6 +408,45 @@ contract OptimisticTaskCoordinatorTest {
     // _postTask 用统一参数发布一个 optimistic 任务。
     function _postTask() internal returns (bytes32) {
         return _postTaskWithCoordinator(coordinator, keccak256("summary"), keccak256("state-root"));
+    }
+
+    function _postTaskWithThreshold(uint32 minAttestationsRequired) internal returns (bytes32) {
+        vm.prank(requester);
+        return coordinator.postTaskWithAttestationThreshold{value: 10 ether}(
+            "ipfs://summary",
+            keccak256("summary"),
+            1 days,
+            2,
+            minAttestationsRequired,
+            2 ether,
+            OptimisticTaskCoordinator.PayoutConfig({
+                executorRewardBps: 7000,
+                validatorRewardBps: 3000,
+                challengerSlashRewardBps: 4000,
+                requesterSlashBps: 6000,
+                challengeBond: 0.5 ether
+            })
+        );
+    }
+
+    function _postPureVMCheckpointTask(bytes32 pureVMTaskId, uint32 checkpointOrdinal) internal returns (bytes32) {
+        vm.prank(requester);
+        return coordinator.postPureVMCheckpointTask{value: 10 ether}(
+            "ipfs://summary",
+            pureVMTaskId,
+            checkpointOrdinal,
+            1 days,
+            2,
+            0,
+            2 ether,
+            OptimisticTaskCoordinator.PayoutConfig({
+                executorRewardBps: 7000,
+                validatorRewardBps: 3000,
+                challengerSlashRewardBps: 4000,
+                requesterSlashBps: 6000,
+                challengeBond: 0.5 ether
+            })
+        );
     }
 
     // _postTaskWithCoordinator 允许测试在不同 coordinator 实例上复用同一套任务发布逻辑。

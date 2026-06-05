@@ -12,6 +12,7 @@ contract PureVMTaskManager {
     uint256 public constant MAX_SUBDIVISION_COMMITMENTS = 128;
     uint8 public constant MAX_DISPUTE_ROUNDS = 16;
     uint64 public constant MAX_ROUND_DURATION = 30 days;
+    uint64 public constant DATA_AVAILABILITY_CHALLENGE_WINDOW = 1 days;
 
     mapping(bytes32 => PureVMTypes.TaskConfig) private tasks;
     mapping(bytes32 => mapping(uint32 => PureVMTypes.CheckpointMeta)) private checkpoints;
@@ -21,10 +22,16 @@ contract PureVMTaskManager {
     mapping(bytes32 => mapping(uint32 => bytes32)) private latestDisputeForCheckpoint;
     mapping(bytes32 => PureVMTypes.DataAvailabilityMeta) private dataAvailability;
     mapping(bytes32 => bytes32[]) private taskDataAvailabilityIds;
+    mapping(bytes32 => PureVMTypes.DataAvailabilityChallengeMeta) private dataAvailabilityChallenges;
+    mapping(bytes32 => bytes32) private latestDataAvailabilityChallengeForData;
+    mapping(bytes32 => PureVMTypes.ArtifactManifestMeta) private artifactManifests;
+    mapping(bytes32 => mapping(uint32 => bytes32)) private checkpointArtifactManifestIds;
     mapping(bytes32 => PureVMTypes.DisputeGame) private disputeGames;
     mapping(bytes32 => PureVMTypes.SubdivisionCommitment[]) private executorSubdivisions;
     mapping(bytes32 => PureVMTypes.SubdivisionCommitment[]) private challengerSubdivisions;
     mapping(address => bool) public authorizedChallengeResolvers;
+    mapping(address => bool) public approvedVerifiers;
+    mapping(address => uint32) public verifierVersions;
     mapping(address => uint256) public taskNonces;
     address public immutable owner;
     uint256 public disputeGameNonce;
@@ -32,6 +39,8 @@ contract PureVMTaskManager {
     error EmptyVerifier();
     error InvalidTask();
     error TaskAlreadyExists();
+    error VerifierNotApproved(address verifier);
+    error InvalidVerifierVersion();
     error InvalidThreshold();
     error InvalidTotalGas();
     error CheckpointAlreadyExists();
@@ -53,6 +62,10 @@ contract PureVMTaskManager {
     error InvalidDataAvailability();
     error DataAvailabilityAlreadyRegistered();
     error DataAvailabilityNotFound();
+    error DataAvailabilityChallengeAlreadyOpen();
+    error InvalidDataAvailabilityChallenge();
+    error DataAvailabilityChallengeExpired();
+    error DataAvailabilityChallengeStillOpen();
     error UnauthorizedDataAvailabilityUpdate();
     error InvalidDisputeGame();
     error DisputeGameAlreadyResolved();
@@ -69,6 +82,7 @@ contract PureVMTaskManager {
         bytes32 indexed taskId,
         address indexed owner,
         address indexed verifier,
+        uint32 verifierVersion,
         bytes32 codeHash,
         uint64 totalGas,
         uint64 snapshotThresholdGas
@@ -113,8 +127,27 @@ contract PureVMTaskManager {
         string uri,
         address publisher
     );
+    event ArtifactManifestRegistered(
+        bytes32 indexed manifestId,
+        bytes32 indexed taskId,
+        uint32 indexed checkpointOrdinal,
+        bytes32 manifestHash,
+        string manifestURI,
+        address publisher
+    );
     event DataAvailabilityStatusUpdated(bytes32 indexed dataId, bool available);
+    event DataAvailabilityChallenged(
+        bytes32 indexed challengeId, bytes32 indexed dataId, address indexed challenger, uint64 deadline
+    );
+    event DataAvailabilityChallengeResolved(
+        bytes32 indexed challengeId,
+        bytes32 indexed dataId,
+        bool challengerWon,
+        address resolver,
+        string uri
+    );
     event ChallengeResolverAuthorizationUpdated(address indexed resolver, bool authorized);
+    event VerifierApprovalUpdated(address indexed verifier, bool approved, uint32 version);
     event DisputeGameCreated(
         bytes32 indexed gameId,
         bytes32 indexed taskId,
@@ -163,9 +196,12 @@ contract PureVMTaskManager {
 
     function createTask(PureVMTypes.TaskCreation calldata creation) external returns (bytes32 taskId) {
         if (creation.verifier == address(0)) revert EmptyVerifier();
+        if (!approvedVerifiers[creation.verifier]) revert VerifierNotApproved(creation.verifier);
         if (creation.snapshotThresholdGas == 0) revert InvalidThreshold();
         if (creation.totalGas == 0) revert InvalidTotalGas();
         _validateUri("initialSnapshotURI", creation.initialSnapshotURI);
+        uint32 verifierVersion = verifierVersions[creation.verifier];
+        if (verifierVersion == 0) revert InvalidVerifierVersion();
 
         uint256 nonce = taskNonces[msg.sender]++;
         taskId = computeTaskId(
@@ -181,6 +217,7 @@ contract PureVMTaskManager {
         tasks[taskId] = PureVMTypes.TaskConfig({
             owner: msg.sender,
             verifier: creation.verifier,
+            verifierVersion: verifierVersion,
             codeHash: creation.codeHash,
             totalGas: creation.totalGas,
             snapshotThresholdGas: creation.snapshotThresholdGas,
@@ -206,7 +243,13 @@ contract PureVMTaskManager {
         verifiedRoots[taskId][creation.initialStateRoot] = true;
 
         emit TaskCreated(
-            taskId, msg.sender, creation.verifier, creation.codeHash, creation.totalGas, creation.snapshotThresholdGas
+            taskId,
+            msg.sender,
+            creation.verifier,
+            verifierVersion,
+            creation.codeHash,
+            creation.totalGas,
+            creation.snapshotThresholdGas
         );
         emit CheckpointRegistered(taskId, 0, 0, 0, creation.initialStateRoot, creation.initialSnapshotHash);
         _registerDataAvailability(
@@ -220,6 +263,23 @@ contract PureVMTaskManager {
             msg.sender,
             true
         );
+        _registerArtifactManifest(
+            taskId,
+            0,
+            checkpointArtifactManifestHash(
+                taskId,
+                0,
+                0,
+                bytes32(0),
+                creation.initialSnapshotHash,
+                bytes32(0),
+                creation.initialStateRoot,
+                creation.initialSnapshotURI,
+                ""
+            ),
+            "",
+            msg.sender
+        );
     }
 
     function verifyAndAppendCheckpoint(
@@ -230,7 +290,32 @@ contract PureVMTaskManager {
         bytes calldata proofBytes,
         string calldata proofURI
     ) external returns (bool) {
-        return _verifyAndAppendCheckpoint(taskId, fromOrdinal, nextCheckpoint, startSnapshotBytes, proofBytes, proofURI);
+        return _verifyAndAppendCheckpoint(
+            taskId, fromOrdinal, nextCheckpoint, startSnapshotBytes, proofBytes, proofURI, bytes32(0), ""
+        );
+    }
+
+    function verifyAndAppendCheckpointWithManifest(
+        bytes32 taskId,
+        uint32 fromOrdinal,
+        PureVMTypes.CheckpointInput calldata nextCheckpoint,
+        bytes calldata startSnapshotBytes,
+        bytes calldata proofBytes,
+        string calldata proofURI,
+        bytes32 artifactManifestHash,
+        string calldata artifactManifestURI
+    ) external returns (bool) {
+        if (artifactManifestHash == bytes32(0)) revert InvalidDataAvailability();
+        return _verifyAndAppendCheckpoint(
+            taskId,
+            fromOrdinal,
+            nextCheckpoint,
+            startSnapshotBytes,
+            proofBytes,
+            proofURI,
+            artifactManifestHash,
+            artifactManifestURI
+        );
     }
 
     function previewCheckpointVerification(
@@ -252,7 +337,33 @@ contract PureVMTaskManager {
         string calldata proofURI
     ) external returns (bool) {
         bytes memory startSnapshotBytes = IPureVMSnapshotStore(snapshotStore).getSnapshot(taskId, fromOrdinal);
-        return _verifyAndAppendCheckpoint(taskId, fromOrdinal, nextCheckpoint, startSnapshotBytes, proofBytes, proofURI);
+        return _verifyAndAppendCheckpoint(
+            taskId, fromOrdinal, nextCheckpoint, startSnapshotBytes, proofBytes, proofURI, bytes32(0), ""
+        );
+    }
+
+    function verifyAndAppendCheckpointFromStoreWithManifest(
+        bytes32 taskId,
+        uint32 fromOrdinal,
+        address snapshotStore,
+        PureVMTypes.CheckpointInput calldata nextCheckpoint,
+        bytes calldata proofBytes,
+        string calldata proofURI,
+        bytes32 artifactManifestHash,
+        string calldata artifactManifestURI
+    ) external returns (bool) {
+        if (artifactManifestHash == bytes32(0)) revert InvalidDataAvailability();
+        bytes memory startSnapshotBytes = IPureVMSnapshotStore(snapshotStore).getSnapshot(taskId, fromOrdinal);
+        return _verifyAndAppendCheckpoint(
+            taskId,
+            fromOrdinal,
+            nextCheckpoint,
+            startSnapshotBytes,
+            proofBytes,
+            proofURI,
+            artifactManifestHash,
+            artifactManifestURI
+        );
     }
 
     function _verifyAndAppendCheckpoint(
@@ -261,11 +372,14 @@ contract PureVMTaskManager {
         PureVMTypes.CheckpointInput calldata nextCheckpoint,
         bytes memory startSnapshotBytes,
         bytes calldata proofBytes,
-        string calldata proofURI
+        string memory proofURI,
+        bytes32 artifactManifestHash,
+        string memory artifactManifestURI
     ) internal returns (bool) {
         _validatePayloadLimits(startSnapshotBytes.length, proofBytes.length);
         _validateUri("snapshotURI", nextCheckpoint.snapshotURI);
         _validateUri("proofURI", proofURI);
+        _validateUri("artifactManifestURI", artifactManifestURI);
 
         PureVMTypes.TaskConfig storage task = tasks[taskId];
         if (!task.exists || task.finalized) revert InvalidTask();
@@ -344,6 +458,21 @@ contract PureVMTaskManager {
             msg.sender,
             true
         );
+        bytes32 manifestHash = artifactManifestHash;
+        if (manifestHash == bytes32(0)) {
+            manifestHash = checkpointArtifactManifestHash(
+                taskId,
+                fromOrdinal,
+                nextOrdinal,
+                start.snapshotBlobHash,
+                nextCheckpoint.snapshotBlobHash,
+                keccak256(proofBytes),
+                traceRoot,
+                nextCheckpoint.snapshotURI,
+                proofURI
+            );
+        }
+        _registerArtifactManifest(taskId, nextOrdinal, manifestHash, artifactManifestURI, msg.sender);
 
         if (nextCheckpoint.gasUsed == task.totalGas) {
             task.finalized = true;
@@ -480,6 +609,16 @@ contract PureVMTaskManager {
             _registerDataAvailability(taskId, kind, ordinal, dataHash, semanticHash, size, uri, msg.sender, available);
     }
 
+    function registerArtifactManifest(
+        bytes32 taskId,
+        uint32 checkpointOrdinal,
+        bytes32 manifestHash,
+        string calldata manifestURI
+    ) external returns (bytes32 manifestId) {
+        if (!tasks[taskId].exists) revert InvalidTask();
+        manifestId = _registerArtifactManifest(taskId, checkpointOrdinal, manifestHash, manifestURI, msg.sender);
+    }
+
     function setDataAvailabilityStatus(bytes32 dataId, bool available) external {
         PureVMTypes.DataAvailabilityMeta storage meta = dataAvailability[dataId];
         if (!meta.available && meta.publisher == address(0)) revert DataAvailabilityNotFound();
@@ -489,11 +628,94 @@ contract PureVMTaskManager {
         emit DataAvailabilityStatusUpdated(dataId, available);
     }
 
+    function challengeDataAvailability(bytes32 dataId) external returns (bytes32 challengeId) {
+        PureVMTypes.DataAvailabilityMeta storage meta = dataAvailability[dataId];
+        if (meta.publisher == address(0)) revert DataAvailabilityNotFound();
+
+        bytes32 latestChallengeId = latestDataAvailabilityChallengeForData[dataId];
+        if (latestChallengeId != bytes32(0)) {
+            PureVMTypes.DataAvailabilityChallengeMeta storage latest = dataAvailabilityChallenges[latestChallengeId];
+            if (latest.status == PureVMTypes.DataAvailabilityChallengeStatus.Open) {
+                revert DataAvailabilityChallengeAlreadyOpen();
+            }
+        }
+
+        challengeId = keccak256(
+            abi.encode("PUREVM_DA_CHALLENGE", dataId, msg.sender, meta.publisher, block.number, latestChallengeId)
+        );
+        dataAvailabilityChallenges[challengeId] = PureVMTypes.DataAvailabilityChallengeMeta({
+            dataId: dataId,
+            taskId: meta.taskId,
+            challenger: msg.sender,
+            publisher: meta.publisher,
+            openedAt: uint64(block.timestamp),
+            deadline: uint64(block.timestamp + DATA_AVAILABILITY_CHALLENGE_WINDOW),
+            challengerWon: false,
+            status: PureVMTypes.DataAvailabilityChallengeStatus.Open
+        });
+        latestDataAvailabilityChallengeForData[dataId] = challengeId;
+        meta.available = false;
+
+        emit DataAvailabilityStatusUpdated(dataId, false);
+        emit DataAvailabilityChallenged(
+            challengeId, dataId, msg.sender, uint64(block.timestamp + DATA_AVAILABILITY_CHALLENGE_WINDOW)
+        );
+    }
+
+    function resolveDataAvailabilityChallenge(bytes32 challengeId, string calldata uri) external {
+        _validateUri("uri", uri);
+        if (bytes(uri).length == 0) revert InvalidDataAvailability();
+
+        PureVMTypes.DataAvailabilityChallengeMeta storage challenge = dataAvailabilityChallenges[challengeId];
+        if (challenge.status != PureVMTypes.DataAvailabilityChallengeStatus.Open) {
+            revert InvalidDataAvailabilityChallenge();
+        }
+        if (block.timestamp > challenge.deadline) revert DataAvailabilityChallengeExpired();
+
+        PureVMTypes.TaskConfig storage task = tasks[challenge.taskId];
+        if (msg.sender != challenge.publisher && msg.sender != task.owner) revert UnauthorizedDataAvailabilityUpdate();
+
+        PureVMTypes.DataAvailabilityMeta storage meta = dataAvailability[challenge.dataId];
+        meta.uri = uri;
+        meta.available = true;
+        challenge.status = PureVMTypes.DataAvailabilityChallengeStatus.ResolvedAvailable;
+
+        emit DataAvailabilityStatusUpdated(challenge.dataId, true);
+        emit DataAvailabilityChallengeResolved(challengeId, challenge.dataId, false, msg.sender, uri);
+    }
+
+    function resolveDataAvailabilityChallengeTimeout(bytes32 challengeId) external {
+        PureVMTypes.DataAvailabilityChallengeMeta storage challenge = dataAvailabilityChallenges[challengeId];
+        if (challenge.status != PureVMTypes.DataAvailabilityChallengeStatus.Open) {
+            revert InvalidDataAvailabilityChallenge();
+        }
+        if (block.timestamp <= challenge.deadline) revert DataAvailabilityChallengeStillOpen();
+
+        PureVMTypes.DataAvailabilityMeta storage meta = dataAvailability[challenge.dataId];
+        meta.available = false;
+        challenge.challengerWon = true;
+        challenge.status = PureVMTypes.DataAvailabilityChallengeStatus.ResolvedUnavailable;
+
+        emit DataAvailabilityStatusUpdated(challenge.dataId, false);
+        emit DataAvailabilityChallengeResolved(challengeId, challenge.dataId, true, msg.sender, meta.uri);
+    }
+
     function setChallengeResolverAuthorization(address resolver, bool authorized) external {
         if (msg.sender != owner) revert OnlyOwner();
         if (resolver == address(0)) revert UnauthorizedChallengeResolver();
         authorizedChallengeResolvers[resolver] = authorized;
         emit ChallengeResolverAuthorizationUpdated(resolver, authorized);
+    }
+
+    function setVerifierApproval(address verifier, uint32 version, bool approved) external {
+        if (msg.sender != owner) revert OnlyOwner();
+        if (verifier == address(0)) revert EmptyVerifier();
+        if (approved && version == 0) revert InvalidVerifierVersion();
+        if (version != 0) {
+            verifierVersions[verifier] = version;
+        }
+        approvedVerifiers[verifier] = approved;
+        emit VerifierApprovalUpdated(verifier, approved, verifierVersions[verifier]);
     }
 
     function createDisputeGame(PureVMTypes.DisputeGameCreation calldata creation)
@@ -875,6 +1097,52 @@ contract PureVMTaskManager {
         emit DataAvailabilityRegistered(dataId, taskId, kind, ordinal, dataHash, semanticHash, size, uri, publisher);
     }
 
+    function _registerArtifactManifest(
+        bytes32 taskId,
+        uint32 checkpointOrdinal,
+        bytes32 manifestHash,
+        string memory manifestURI,
+        address publisher
+    ) internal returns (bytes32 manifestId) {
+        if (manifestHash == bytes32(0) || publisher == address(0)) revert InvalidDataAvailability();
+        _validateUri("manifestURI", manifestURI);
+
+        manifestId = artifactManifestId(taskId, checkpointOrdinal, manifestHash);
+        bytes32 existingForCheckpoint = checkpointArtifactManifestIds[taskId][checkpointOrdinal];
+        if (existingForCheckpoint != bytes32(0) && existingForCheckpoint != manifestId) {
+            revert DataAvailabilityAlreadyRegistered();
+        }
+
+        PureVMTypes.ArtifactManifestMeta storage existing = artifactManifests[manifestId];
+        if (existing.exists) {
+            return manifestId;
+        }
+
+        artifactManifests[manifestId] = PureVMTypes.ArtifactManifestMeta({
+            taskId: taskId,
+            checkpointOrdinal: checkpointOrdinal,
+            manifestHash: manifestHash,
+            manifestURI: manifestURI,
+            publisher: publisher,
+            registeredAtBlock: uint64(block.number),
+            exists: true
+        });
+        checkpointArtifactManifestIds[taskId][checkpointOrdinal] = manifestId;
+        _registerDataAvailability(
+            taskId,
+            PureVMTypes.DataKind.Manifest,
+            checkpointOrdinal,
+            manifestHash,
+            keccak256(abi.encode(taskId, checkpointOrdinal)),
+            uint64(bytes(manifestURI).length),
+            manifestURI,
+            publisher,
+            bytes(manifestURI).length > 0
+        );
+
+        emit ArtifactManifestRegistered(manifestId, taskId, checkpointOrdinal, manifestHash, manifestURI, publisher);
+    }
+
     function _validatePayloadLimits(uint256 snapshotSize, uint256 proofSize) internal pure {
         if (snapshotSize > MAX_DIRECT_SNAPSHOT_BYTES) {
             revert InterfaceLimitExceeded("snapshotBytes", snapshotSize, MAX_DIRECT_SNAPSHOT_BYTES);
@@ -1005,6 +1273,30 @@ contract PureVMTaskManager {
         return taskDataAvailabilityIds[taskId];
     }
 
+    function getDataAvailabilityChallenge(bytes32 challengeId)
+        external
+        view
+        returns (PureVMTypes.DataAvailabilityChallengeMeta memory)
+    {
+        return dataAvailabilityChallenges[challengeId];
+    }
+
+    function getLatestDataAvailabilityChallengeForData(bytes32 dataId) external view returns (bytes32) {
+        return latestDataAvailabilityChallengeForData[dataId];
+    }
+
+    function getArtifactManifest(bytes32 manifestId)
+        external
+        view
+        returns (PureVMTypes.ArtifactManifestMeta memory)
+    {
+        return artifactManifests[manifestId];
+    }
+
+    function getCheckpointArtifactManifestId(bytes32 taskId, uint32 checkpointOrdinal) external view returns (bytes32) {
+        return checkpointArtifactManifestIds[taskId][checkpointOrdinal];
+    }
+
     function getDisputeGame(bytes32 gameId) external view returns (PureVMTypes.DisputeGame memory) {
         return disputeGames[gameId];
     }
@@ -1076,6 +1368,41 @@ contract PureVMTaskManager {
         bytes32 semanticHash
     ) public pure returns (bytes32) {
         return keccak256(abi.encode("PUREVM_DA", taskId, kind, ordinal, dataHash, semanticHash));
+    }
+
+    function artifactManifestId(bytes32 taskId, uint32 checkpointOrdinal, bytes32 manifestHash)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode("PUREVM_ARTIFACT_MANIFEST", taskId, checkpointOrdinal, manifestHash));
+    }
+
+    function checkpointArtifactManifestHash(
+        bytes32 taskId,
+        uint32 fromOrdinal,
+        uint32 toOrdinal,
+        bytes32 startSnapshotBlobHash,
+        bytes32 endSnapshotBlobHash,
+        bytes32 proofBlobHash,
+        bytes32 semanticHash,
+        string memory snapshotURI,
+        string memory proofURI
+    ) public pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                "PUREVM_CHECKPOINT_ARTIFACTS",
+                taskId,
+                fromOrdinal,
+                toOrdinal,
+                startSnapshotBlobHash,
+                endSnapshotBlobHash,
+                proofBlobHash,
+                semanticHash,
+                snapshotURI,
+                proofURI
+            )
+        );
     }
 
     function subdivisionRootHash(PureVMTypes.SubdivisionCommitment[] calldata commitments)

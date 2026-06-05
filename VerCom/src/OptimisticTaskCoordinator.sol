@@ -41,6 +41,7 @@ contract OptimisticTaskCoordinator {
         uint64 executionDeadline;
         uint64 challengeDeadline;
         uint32 validatorCount;
+        uint32 minAttestationsRequired;
         uint16 executorRewardBps;
         uint16 validatorRewardBps;
         uint16 challengerSlashRewardBps;
@@ -48,6 +49,15 @@ contract OptimisticTaskCoordinator {
         uint256 challengeBond;
         TaskStatus status;
         address challenger;
+        bytes32 artifactManifestHash;
+        string artifactManifestURI;
+        bool artifactManifestSubmitted;
+    }
+
+    struct PureVMCheckpointBinding {
+        bytes32 pureVMTaskId;
+        uint32 checkpointOrdinal;
+        bool exists;
     }
 
     ValidatorManager public immutable validatorManager;
@@ -60,17 +70,22 @@ contract OptimisticTaskCoordinator {
     mapping(bytes32 => mapping(address => bool)) public isSelectedValidator;
     mapping(bytes32 => mapping(address => bool)) public hasAttested;
     mapping(bytes32 => address[]) private attesters;
+    mapping(bytes32 => PureVMCheckpointBinding) public pureVMCheckpointBindings;
 
     error InvalidTask();
     error TaskAlreadyExists();
     error RewardRequired();
     error InvalidWindow();
     error InvalidValidatorCount();
+    error InvalidAttestationThreshold();
     error InvalidPayoutConfig();
+    error InvalidPureVMBinding();
     error ExecutorAlreadyAssigned();
     error ExecutorBondTooSmall();
     error OnlyExecutor();
+    error OnlyRequester();
     error ExecutionDeadlinePassed();
+    error ExecutionDeadlineNotPassed();
     error ResultNotSubmitted();
     error NotSelectedValidator();
     error AlreadyAttested();
@@ -80,6 +95,8 @@ contract OptimisticTaskCoordinator {
     error ChallengeAlreadyResolved();
     error ChallengeFailed();
     error AlreadyResolved();
+    error AttestationThresholdNotMet(uint256 got, uint256 want);
+    error ArtifactManifestRequired();
     error InterfaceLimitExceeded(string field, uint256 size, uint256 limit);
 
     event TaskPosted(
@@ -94,6 +111,12 @@ contract OptimisticTaskCoordinator {
     event TaskClaimed(bytes32 indexed taskId, address indexed executor, uint256 bondPosted);
     event ResultSubmitted(
         bytes32 indexed taskId, bytes32 indexed resultHash, bytes32 claimedStateRoot, uint64 challengeDeadline
+    );
+    event PureVMCheckpointBound(
+        bytes32 indexed taskId, bytes32 indexed pureVMTaskId, uint32 indexed checkpointOrdinal, bytes32 summaryHash
+    );
+    event TaskArtifactManifestSubmitted(
+        bytes32 indexed taskId, bytes32 indexed manifestHash, string manifestURI, address indexed publisher
     );
     event ValidatorsSelected(bytes32 indexed taskId, address[] validators);
     event ResultAttested(bytes32 indexed taskId, address indexed validator);
@@ -113,6 +136,21 @@ contract OptimisticTaskCoordinator {
         uint256 validatorPayoutPerAttester,
         uint256 requesterRefund
     );
+    event TaskCancelled(
+        bytes32 indexed taskId,
+        address indexed requester,
+        TaskStatus previousStatus,
+        uint256 requesterPayout,
+        uint256 executorSlash
+    );
+    event UnderAttestedTaskCancelled(
+        bytes32 indexed taskId,
+        address indexed requester,
+        uint256 attestations,
+        uint256 requiredAttestations,
+        uint256 requesterPayout,
+        uint256 executorBondRefund
+    );
 
     constructor(address validatorManager_, address challengeResolver_, uint64 defaultChallengeWindow_) {
         validatorManager = ValidatorManager(validatorManager_);
@@ -128,9 +166,70 @@ contract OptimisticTaskCoordinator {
         uint256 executorBondRequired,
         PayoutConfig calldata payoutConfig
     ) external payable returns (bytes32 taskId) {
+        taskId = _postTask(
+            summaryURI, summaryHash, executionWindow, validatorCount, 0, executorBondRequired, payoutConfig
+        );
+    }
+
+    function postTaskWithAttestationThreshold(
+        string calldata summaryURI,
+        bytes32 summaryHash,
+        uint64 executionWindow,
+        uint32 validatorCount,
+        uint32 minAttestationsRequired,
+        uint256 executorBondRequired,
+        PayoutConfig calldata payoutConfig
+    ) external payable returns (bytes32 taskId) {
+        taskId = _postTask(
+            summaryURI,
+            summaryHash,
+            executionWindow,
+            validatorCount,
+            minAttestationsRequired,
+            executorBondRequired,
+            payoutConfig
+        );
+    }
+
+    function postPureVMCheckpointTask(
+        string calldata summaryURI,
+        bytes32 pureVMTaskId,
+        uint32 checkpointOrdinal,
+        uint64 executionWindow,
+        uint32 validatorCount,
+        uint32 minAttestationsRequired,
+        uint256 executorBondRequired,
+        PayoutConfig calldata payoutConfig
+    ) external payable returns (bytes32 taskId) {
+        if (pureVMTaskId == bytes32(0) || checkpointOrdinal == 0) revert InvalidPureVMBinding();
+        bytes32 summaryHash = checkpointTaskSummaryHash(pureVMTaskId, checkpointOrdinal);
+        taskId = _postTask(
+            summaryURI,
+            summaryHash,
+            executionWindow,
+            validatorCount,
+            minAttestationsRequired,
+            executorBondRequired,
+            payoutConfig
+        );
+        pureVMCheckpointBindings[taskId] =
+            PureVMCheckpointBinding({pureVMTaskId: pureVMTaskId, checkpointOrdinal: checkpointOrdinal, exists: true});
+        emit PureVMCheckpointBound(taskId, pureVMTaskId, checkpointOrdinal, summaryHash);
+    }
+
+    function _postTask(
+        string calldata summaryURI,
+        bytes32 summaryHash,
+        uint64 executionWindow,
+        uint32 validatorCount,
+        uint32 minAttestationsRequired,
+        uint256 executorBondRequired,
+        PayoutConfig calldata payoutConfig
+    ) internal returns (bytes32 taskId) {
         if (msg.value == 0) revert RewardRequired();
         if (executionWindow == 0) revert InvalidWindow();
         if (validatorCount == 0) revert InvalidValidatorCount();
+        if (minAttestationsRequired > validatorCount) revert InvalidAttestationThreshold();
         _validateUri("summaryURI", summaryURI);
         _validatePayoutConfig(payoutConfig);
 
@@ -142,6 +241,7 @@ contract OptimisticTaskCoordinator {
                 summaryHash,
                 executionWindow,
                 validatorCount,
+                minAttestationsRequired,
                 executorBondRequired,
                 payoutConfig.executorRewardBps,
                 payoutConfig.validatorRewardBps,
@@ -167,13 +267,17 @@ contract OptimisticTaskCoordinator {
             executionDeadline: uint64(block.timestamp + executionWindow),
             challengeDeadline: 0,
             validatorCount: validatorCount,
+            minAttestationsRequired: minAttestationsRequired,
             executorRewardBps: payoutConfig.executorRewardBps,
             validatorRewardBps: payoutConfig.validatorRewardBps,
             challengerSlashRewardBps: payoutConfig.challengerSlashRewardBps,
             requesterSlashBps: payoutConfig.requesterSlashBps,
             challengeBond: payoutConfig.challengeBond,
             status: TaskStatus.Open,
-            challenger: address(0)
+            challenger: address(0),
+            artifactManifestHash: bytes32(0),
+            artifactManifestURI: "",
+            artifactManifestSubmitted: false
         });
 
         emit TaskPosted(
@@ -191,6 +295,7 @@ contract OptimisticTaskCoordinator {
         TaskConfig storage task = tasks[taskId];
         if (task.requester == address(0) || task.status != TaskStatus.Open) revert InvalidTask();
         if (task.executor != address(0)) revert ExecutorAlreadyAssigned();
+        if (block.timestamp > task.executionDeadline) revert ExecutionDeadlinePassed();
         if (msg.value < task.executorBondRequired) revert ExecutorBondTooSmall();
 
         task.executor = msg.sender;
@@ -202,6 +307,33 @@ contract OptimisticTaskCoordinator {
 
     function submitResult(bytes32 taskId, string calldata resultURI, bytes32 resultHash, bytes32 claimedStateRoot)
         external
+    {
+        if (pureVMCheckpointBindings[taskId].exists) revert ArtifactManifestRequired();
+        _submitResult(taskId, resultURI, resultHash, claimedStateRoot);
+    }
+
+    function submitPureVMCheckpointResult(
+        bytes32 taskId,
+        string calldata resultURI,
+        bytes32 resultHash,
+        bytes32 claimedStateRoot,
+        bytes32 artifactManifestHash,
+        string calldata artifactManifestURI
+    ) external {
+        if (!pureVMCheckpointBindings[taskId].exists) revert InvalidPureVMBinding();
+        if (artifactManifestHash == bytes32(0)) revert ArtifactManifestRequired();
+        _validateUri("artifactManifestURI", artifactManifestURI);
+        _submitResult(taskId, resultURI, resultHash, claimedStateRoot);
+
+        TaskConfig storage task = tasks[taskId];
+        task.artifactManifestHash = artifactManifestHash;
+        task.artifactManifestURI = artifactManifestURI;
+        task.artifactManifestSubmitted = true;
+        emit TaskArtifactManifestSubmitted(taskId, artifactManifestHash, artifactManifestURI, msg.sender);
+    }
+
+    function _submitResult(bytes32 taskId, string calldata resultURI, bytes32 resultHash, bytes32 claimedStateRoot)
+        internal
     {
         TaskConfig storage task = tasks[taskId];
         if (task.status != TaskStatus.Claimed) revert InvalidTask();
@@ -225,6 +357,34 @@ contract OptimisticTaskCoordinator {
             isSelectedValidator[taskId][validators[i]] = true;
         }
         emit ValidatorsSelected(taskId, validators);
+    }
+
+    function cancelExpiredTask(bytes32 taskId) external returns (bool) {
+        TaskConfig storage task = tasks[taskId];
+        if (task.requester == address(0)) revert InvalidTask();
+        if (msg.sender != task.requester) revert OnlyRequester();
+        if (block.timestamp <= task.executionDeadline) revert ExecutionDeadlineNotPassed();
+        if (task.status != TaskStatus.Open && task.status != TaskStatus.Claimed) revert InvalidTask();
+
+        TaskStatus previousStatus = task.status;
+        uint256 requesterPayout = task.rewardPool;
+        uint256 executorSlash = 0;
+        if (previousStatus == TaskStatus.Claimed) {
+            executorSlash = task.executorBondPosted;
+            requesterPayout += executorSlash;
+        }
+
+        task.status = TaskStatus.Cancelled;
+        task.rewardPool = 0;
+        task.executorBondPosted = 0;
+
+        if (requesterPayout > 0) {
+            (bool okRequester,) = payable(task.requester).call{value: requesterPayout}("");
+            require(okRequester, "requester cancellation payout failed");
+        }
+
+        emit TaskCancelled(taskId, task.requester, previousStatus, requesterPayout, executorSlash);
+        return true;
     }
 
     function attestResult(bytes32 taskId) external {
@@ -288,6 +448,10 @@ contract OptimisticTaskCoordinator {
         if (task.status != TaskStatus.ResultSubmitted) revert InvalidTask();
         if (block.timestamp < task.challengeDeadline) revert ChallengeWindowNotClosed();
         if (task.status == TaskStatus.Challenged || task.status == TaskStatus.Finalized) revert AlreadyResolved();
+        uint256 attesterCount = attesters[taskId].length;
+        if (attesterCount < task.minAttestationsRequired) {
+            revert AttestationThresholdNotMet(attesterCount, task.minAttestationsRequired);
+        }
 
         task.status = TaskStatus.Finalized;
 
@@ -304,12 +468,12 @@ contract OptimisticTaskCoordinator {
 
         uint256 validatorPayoutPerAttester = 0;
         address[] storage signedAttesters = attesters[taskId];
-        if (signedAttesters.length > 0) {
-            validatorPayoutPerAttester = validatorRewardPool / signedAttesters.length;
-            uint256 distributed = validatorPayoutPerAttester * signedAttesters.length;
+        if (attesterCount > 0) {
+            validatorPayoutPerAttester = validatorRewardPool / attesterCount;
+            uint256 distributed = validatorPayoutPerAttester * attesterCount;
             requesterRefund += validatorRewardPool - distributed;
 
-            for (uint256 i = 0; i < signedAttesters.length; i++) {
+            for (uint256 i = 0; i < attesterCount; i++) {
                 (bool okValidator,) = payable(signedAttesters[i]).call{value: validatorPayoutPerAttester}("");
                 require(okValidator, "validator payout failed");
             }
@@ -326,12 +490,58 @@ contract OptimisticTaskCoordinator {
         return true;
     }
 
+    function cancelUnderAttestedTask(bytes32 taskId) external returns (bool) {
+        TaskConfig storage task = tasks[taskId];
+        if (task.requester == address(0)) revert InvalidTask();
+        if (msg.sender != task.requester) revert OnlyRequester();
+        if (task.status != TaskStatus.ResultSubmitted) revert InvalidTask();
+        if (block.timestamp < task.challengeDeadline) revert ChallengeWindowNotClosed();
+
+        uint256 attesterCount = attesters[taskId].length;
+        if (attesterCount >= task.minAttestationsRequired) {
+            revert AttestationThresholdNotMet(attesterCount, task.minAttestationsRequired);
+        }
+
+        uint256 requesterPayout = task.rewardPool;
+        uint256 executorBondRefund = task.executorBondPosted;
+        task.status = TaskStatus.Cancelled;
+        task.rewardPool = 0;
+        task.executorBondPosted = 0;
+
+        if (requesterPayout > 0) {
+            (bool okRequester,) = payable(task.requester).call{value: requesterPayout}("");
+            require(okRequester, "requester under-attested payout failed");
+        }
+        if (executorBondRefund > 0) {
+            (bool okExecutor,) = payable(task.executor).call{value: executorBondRefund}("");
+            require(okExecutor, "executor under-attested bond refund failed");
+        }
+
+        emit UnderAttestedTaskCancelled(
+            taskId,
+            task.requester,
+            attesterCount,
+            task.minAttestationsRequired,
+            requesterPayout,
+            executorBondRefund
+        );
+        return true;
+    }
+
     function getSelectedValidators(bytes32 taskId) external view returns (address[] memory) {
         return selectedValidators[taskId];
     }
 
     function getAttesters(bytes32 taskId) external view returns (address[] memory) {
         return attesters[taskId];
+    }
+
+    function getTask(bytes32 taskId) external view returns (TaskConfig memory) {
+        return tasks[taskId];
+    }
+
+    function checkpointTaskSummaryHash(bytes32 pureVMTaskId, uint32 checkpointOrdinal) public pure returns (bytes32) {
+        return keccak256(abi.encode("PUREVM_CHECKPOINT_TASK", pureVMTaskId, checkpointOrdinal));
     }
 
     function _validatePayoutConfig(PayoutConfig memory config) internal pure {

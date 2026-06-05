@@ -7,6 +7,14 @@
 - 生成和验证状态转移 proof
 - 作为链上乐观挑战的链下执行基座
 
+## 相关文档
+
+- [`../docs/QUICKSTART.md`](../docs/QUICKSTART.md): 本地测试、生成 E2E artifact 和验证首段 proof。
+- [`../docs/PUREVM_SEMANTICS.md`](../docs/PUREVM_SEMANTICS.md): 当前 opcode 子集、Gas 表、state root 和 snapshot 语义。
+- [`../docs/ARTIFACTS.md`](../docs/ARTIFACTS.md): `generate-artifacts` 输出目录和 manifest 字段说明。
+- [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md): snapshot、transition proof、checkpoint 和 challenge 的协议绑定。
+- [`../README.md`](../README.md): 完整系统设计和端到端流程。
+
 ## 主要能力
 
 - 256 位栈式执行模型
@@ -107,6 +115,28 @@ go run ./cmd/vmcli -cmd verify-precompile -snap snapshot.json -proof proof.json
 go run ./cmd/vmcli -cmd verify-index -index path\\to\\snapshot_index.json -ordinal 3
 ```
 
+### 生成 VerCom E2E 产物
+
+```bash
+go run ./cmd/vmcli \
+  -cmd generate-artifacts \
+  -out test/testdata/e2e_artifacts/current \
+  -gas 100000 \
+  -threshold 500 \
+  -chainid 1337 \
+  -proofs=true
+```
+
+这个命令会生成：
+
+- `task_manifest.json`
+- `task_bytecode.hex`
+- `snapshot_index.json`
+- `snapshot_*.json`
+- `proof_*.json`
+
+默认示例规模会让相邻 proof 保持在 Go precompile / Solidity adapter 的 1MB proof payload 上限内，适合 `VerCom/script/RunPureVMChallengeE2E.s.sol` 和 `RunPureVMChallengeE2EScriptTest` 读取。完整长 Gas 任务适合做链下快照和索引压力测试；如果为几百万步相邻段生成逐步 JSON proof，通常会超过当前接口上限。
+
 ### 定位第一分歧段
 
 ```powershell
@@ -146,6 +176,14 @@ purevm/test/testdata/long_run_artifacts/<timestamp>/
 - `task_manifest.json`
 - `snapshot_index.json`
 - `snapshot_*.json`
+- 可选 `proof_*.json`
+
+链上 E2E 脚本推荐使用 `generate-artifacts` 生成的小型真实产物：
+
+```bash
+go run ./cmd/vmcli -cmd generate-artifacts -out test/testdata/e2e_artifacts/current -gas 100000 -threshold 500 -proofs=true
+go run ./cmd/vmcli -cmd verify-precompile -snap test/testdata/e2e_artifacts/current/snapshot_000_initial.json -proof test/testdata/e2e_artifacts/current/proof_001_from_0_steps_122.json
+```
 
 ## 已有测试覆盖
 
@@ -166,4 +204,4 @@ purevm/test/testdata/long_run_artifacts/<timestamp>/
 
 - 当前实现的是一组 PureVM 支持的 EVM 风格 opcode 子集，不是完整 EVM。
 - 长任务测试默认不会全量生成所有 proof 文件，避免体积过大；需要时可显式打开。
-- 更完整的交接说明见根目录 [`../DESIGN_HANDOFF.md`](../DESIGN_HANDOFF.md)。
+- 更完整的设计说明、协议不变量和端到端流程见根目录 [`../README.md`](../README.md)。

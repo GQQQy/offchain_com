@@ -16,6 +16,7 @@ library PureVMTypes {
     struct TaskConfig {
         address owner;
         address verifier;
+        uint32 verifierVersion;
         bytes32 codeHash;
         uint64 totalGas;
         uint64 snapshotThresholdGas;
@@ -84,7 +85,8 @@ library PureVMTypes {
         Unknown,
         Snapshot,
         Proof,
-        Subdivision
+        Subdivision,
+        Manifest
     }
 
     struct DataAvailabilityMeta {
@@ -98,6 +100,34 @@ library PureVMTypes {
         address publisher;
         uint64 registeredAtBlock;
         bool available;
+    }
+
+    enum DataAvailabilityChallengeStatus {
+        None,
+        Open,
+        ResolvedAvailable,
+        ResolvedUnavailable
+    }
+
+    struct DataAvailabilityChallengeMeta {
+        bytes32 dataId;
+        bytes32 taskId;
+        address challenger;
+        address publisher;
+        uint64 openedAt;
+        uint64 deadline;
+        bool challengerWon;
+        DataAvailabilityChallengeStatus status;
+    }
+
+    struct ArtifactManifestMeta {
+        bytes32 taskId;
+        uint32 checkpointOrdinal;
+        bytes32 manifestHash;
+        string manifestURI;
+        address publisher;
+        uint64 registeredAtBlock;
+        bool exists;
     }
 
     struct SubdivisionCommitment {

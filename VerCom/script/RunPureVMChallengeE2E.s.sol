@@ -11,6 +11,7 @@ interface Vm {
     function envAddress(string calldata) external returns (address);
     function envUint(string calldata) external returns (uint256);
     function envString(string calldata) external returns (string memory);
+    function envOr(string calldata, string calldata) external returns (string memory);
     function envBytes32(string calldata) external returns (bytes32);
     function readFile(string calldata) external returns (string memory);
     function readFileBinary(string calldata) external returns (bytes memory);
@@ -32,17 +33,20 @@ contract RunPureVMChallengeE2EScript {
         uint256 fromOrdinalUint = vm.envUint("PUREVM_FROM_ORDINAL");
         uint32 fromOrdinal = uint32(fromOrdinalUint);
 
-        string memory indexPath = string.concat(artifactDir, "\\snapshot_index.json");
-        string memory manifestPath = string.concat(artifactDir, "\\task_manifest.json");
+        string memory indexPath = _joinPath(artifactDir, "snapshot_index.json");
+        string memory manifestPath = _joinPath(artifactDir, "task_manifest.json");
 
         string memory indexJson = vm.readFile(indexPath);
         string memory manifestJson = vm.readFile(manifestPath);
 
         string memory startSnapshotFile =
-            string.concat(artifactDir, "\\", _indexString(indexJson, fromOrdinalUint, ".snapshot_file"));
+            _joinPath(artifactDir, _indexString(indexJson, fromOrdinalUint, ".snapshot_file"));
         string memory nextSnapshotFile =
-            string.concat(artifactDir, "\\", _indexString(indexJson, fromOrdinalUint + 1, ".snapshot_file"));
-        string memory proofFile = vm.envString("PUREVM_PROOF_FILE");
+            _joinPath(artifactDir, _indexString(indexJson, fromOrdinalUint + 1, ".snapshot_file"));
+        string memory proofFile = vm.envOr("PUREVM_PROOF_FILE", "");
+        if (bytes(proofFile).length == 0) {
+            proofFile = _joinPath(artifactDir, _indexString(indexJson, fromOrdinalUint, ".adjacent_proof_file"));
+        }
 
         bytes memory startSnapshotBytes = vm.readFileBinary(startSnapshotFile);
         bytes memory nextSnapshotBytes = vm.readFileBinary(nextSnapshotFile);
@@ -84,12 +88,13 @@ contract RunPureVMChallengeE2EScript {
             })
         );
 
-        bytes32 checkpointSummaryHash = taskManager.checkpointTaskSummaryHash(pureVMTaskId, fromOrdinal + 1);
-        optimisticTaskId = coordinator.postTask{value: vm.envUint("OPTIMISTIC_REWARD_POOL")}(
+        optimisticTaskId = coordinator.postPureVMCheckpointTask{value: vm.envUint("OPTIMISTIC_REWARD_POOL")}(
             vm.envString("OPTIMISTIC_SUMMARY_URI"),
-            checkpointSummaryHash,
+            pureVMTaskId,
+            fromOrdinal + 1,
             uint64(vm.envUint("OPTIMISTIC_EXECUTION_WINDOW")),
             uint32(vm.envUint("OPTIMISTIC_VALIDATOR_COUNT")),
+            uint32(vm.envUint("OPTIMISTIC_MIN_ATTESTATIONS")),
             vm.envUint("OPTIMISTIC_EXECUTOR_BOND"),
             OptimisticTaskCoordinator.PayoutConfig({
                 executorRewardBps: uint16(vm.envUint("OPTIMISTIC_EXECUTOR_REWARD_BPS")),
@@ -115,11 +120,26 @@ contract RunPureVMChallengeE2EScript {
             snapshotBlobHash: keccak256(bytes("bad-snapshot")),
             snapshotURI: vm.envString("OPTIMISTIC_RESULT_URI")
         });
-        coordinator.submitResult(
+        bytes32 artifactManifestHash = keccak256(
+            abi.encode(
+                "PUREVM_E2E_ARTIFACT_MANIFEST",
+                keccak256(bytes(manifestJson)),
+                keccak256(bytes(indexJson)),
+                keccak256(startSnapshotBytes),
+                keccak256(nextSnapshotBytes),
+                keccak256(proofBytes),
+                startSnapshotFile,
+                nextSnapshotFile,
+                proofFile
+            )
+        );
+        coordinator.submitPureVMCheckpointResult(
             optimisticTaskId,
             vm.envString("OPTIMISTIC_RESULT_URI"),
             taskManager.checkpointClaimHash(pureVMTaskId, fromOrdinal + 1, badClaimedCheckpoint),
-            badClaimedCheckpoint.stateRoot
+            badClaimedCheckpoint.stateRoot,
+            artifactManifestHash,
+            vm.envString("OPTIMISTIC_ARTIFACT_MANIFEST_URI")
         );
         vm.stopBroadcast();
 
@@ -138,6 +158,18 @@ contract RunPureVMChallengeE2EScript {
         vm.stopBroadcast();
 
         challengeResolver;
+    }
+
+    function _joinPath(string memory dir, string memory file) internal pure returns (string memory) {
+        bytes memory dirBytes = bytes(dir);
+        if (dirBytes.length == 0) {
+            return file;
+        }
+        bytes1 last = dirBytes[dirBytes.length - 1];
+        if (last == "/" || last == "\\") {
+            return string.concat(dir, file);
+        }
+        return string.concat(dir, "/", file);
     }
 
     function _indexString(string memory indexJson, uint256 ordinal, string memory suffix)

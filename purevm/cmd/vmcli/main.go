@@ -3,29 +3,36 @@ package main
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"purevm/core"
 	"purevm/precompile"
 	"purevm/proof"
 	"time"
+
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 func main() {
 	var (
-		cmd           = flag.String("cmd", "run", "Command: run|snapshot|check-snapshot|prove|prove-snapshot|verify|verify-precompile|verify-index|locate-dispute")
+		cmd           = flag.String("cmd", "run", "Command: run|snapshot|check-snapshot|prove|prove-snapshot|verify|verify-precompile|verify-index|locate-dispute|generate-artifacts")
 		codeHex       = flag.String("code", "", "Bytecode hex (e.g. 6005600301)")
 		gas           = flag.Uint64("gas", 100000, "Gas limit")
 		steps         = flag.Uint64("steps", 0, "Steps to execute (0=all)")
 		snapFile      = flag.String("snap", "", "Snapshot file path")
 		proofFile     = flag.String("proof", "", "Proof file path")
 		indexFile     = flag.String("index", "", "Snapshot index file path")
+		outDir        = flag.String("out", "", "Artifact output directory for generate-artifacts")
 		claimedIndex  = flag.String("claimed-index", "", "Executor-claimed snapshot index file path")
 		verifiedIndex = flag.String("verified-index", "", "Validator-replayed snapshot index file path")
 		ordinal       = flag.Int("ordinal", 0, "Snapshot ordinal in index")
 		full          = flag.Bool("full", false, "Verify the full adjacent interval when using verify-index")
 		chainID       = flag.Uint64("chainid", 1337, "Chain ID for snapshot")
+		thresholdGas  = flag.Uint64("threshold", 500, "Snapshot threshold gas for generate-artifacts")
+		writeProofs   = flag.Bool("proofs", true, "Write full adjacent proof files for generate-artifacts")
 	)
 	flag.Parse()
 
@@ -48,6 +55,8 @@ func main() {
 		verifyIndex(*indexFile, *ordinal, *steps, *full)
 	case "locate-dispute":
 		locateDispute(*claimedIndex, *verifiedIndex)
+	case "generate-artifacts":
+		generateArtifacts(*outDir, *chainID, *gas, *thresholdGas, *writeProofs)
 	default:
 		fmt.Printf("Unknown command: %s\n", *cmd)
 		os.Exit(1)
@@ -385,6 +394,276 @@ func locateDispute(claimedIndexFile, verifiedIndexFile string) {
 		fmt.Printf("Verified next root: %s\n", result.VerifiedNextRoot.Hex())
 	}
 	fmt.Printf("Reason:             %s\n", result.Reason)
+}
+
+type artifactTaskManifest struct {
+	BytecodeHex               string `json:"bytecode_hex"`
+	CodeHash                  string `json:"code_hash"`
+	LoopIterations            uint32 `json:"loop_iterations"`
+	TotalGas                  uint64 `json:"total_gas"`
+	SnapshotThresholdGas      uint64 `json:"snapshot_threshold_gas"`
+	ChainID                   uint64 `json:"chain_id"`
+	GasFormula                string `json:"gas_formula"`
+	ArtifactKind              string `json:"artifact_kind"`
+	ProofsGenerated           bool   `json:"proofs_generated"`
+	MaxSnapshotBytes          uint64 `json:"max_snapshot_bytes"`
+	MaxProofBytes             uint64 `json:"max_proof_bytes"`
+	RecommendedFromOrdinal    uint32 `json:"recommended_from_ordinal"`
+	RecommendedProofFile      string `json:"recommended_proof_file,omitempty"`
+	RecommendedProofBytes     uint64 `json:"recommended_proof_bytes,omitempty"`
+	RecommendedSnapshotFile   string `json:"recommended_snapshot_file,omitempty"`
+	RecommendedNextCheckpoint string `json:"recommended_next_checkpoint,omitempty"`
+}
+
+const (
+	countdownSetupAndExitGas uint64 = 24
+	countdownLoopGas         uint64 = 37
+)
+
+func generateArtifacts(outDir string, chainID, gasFloor, thresholdGas uint64, writeProofs bool) {
+	if outDir == "" {
+		outDir = filepath.Join("testdata", "e2e_artifacts", time.Now().Format("20060102_150405"))
+	}
+	if thresholdGas == 0 {
+		fmt.Printf("Artifact generation requires -threshold > 0\n")
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fmt.Printf("Failed to create artifact directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	iterations := countdownIterationsForGasFloor(gasFloor)
+	code := buildCountdownLoop(iterations)
+	totalGas := countdownGasForIterations(iterations)
+	codeHex := "0x" + hex.EncodeToString(code)
+
+	index := core.NewSnapshotIndex(chainID, totalGas, thresholdGas)
+	index.BytecodeHex = codeHex
+	index.Meta = map[string]string{
+		"artifact_kind": "e2e",
+		"gas_formula":   "totalGas = 24 + 37 * iterations",
+	}
+
+	vm := core.NewVM(code, totalGas)
+	vm.ChainID = chainID
+
+	initialPath := filepath.Join(outDir, "snapshot_000_initial.json")
+	initialSnap := core.NewStandardSnapshot(vm.State, vm.ChainID)
+	initialSnap.Meta = map[string]string{
+		"gas_used":      "0",
+		"gas_threshold": fmt.Sprintf("%d", thresholdGas),
+	}
+	if err := initialSnap.WriteFile(initialPath); err != nil {
+		fmt.Printf("Failed to write initial snapshot: %v\n", err)
+		os.Exit(1)
+	}
+	index.AddSnapshot(filepath.Base(initialPath), initialSnap, 0)
+
+	snapshotPaths := []string{initialPath}
+	windowGasUsed := uint64(0)
+	for !vm.Halted {
+		nextGas, err := vm.PeekNextGasCost()
+		if err != nil {
+			fmt.Printf("Gas peek failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		gasUsed := totalGas - vm.State.Gas
+		if windowGasUsed > 0 && windowGasUsed+nextGas > thresholdGas {
+			path := filepath.Join(
+				outDir,
+				fmt.Sprintf("snapshot_%03d_step_%d_gas_%d.json", len(snapshotPaths), vm.State.StepCount, gasUsed),
+			)
+			snap := core.NewStandardSnapshot(vm.State, vm.ChainID)
+			snap.Meta = map[string]string{
+				"gas_used":      fmt.Sprintf("%d", gasUsed),
+				"gas_threshold": fmt.Sprintf("%d", thresholdGas),
+			}
+			if err := snap.WriteFile(path); err != nil {
+				fmt.Printf("Failed to write snapshot: %v\n", err)
+				os.Exit(1)
+			}
+			snapshotPaths = append(snapshotPaths, path)
+			index.AddSnapshot(filepath.Base(path), snap, gasUsed)
+			windowGasUsed = 0
+		}
+
+		if err := vm.Step(); err != nil {
+			fmt.Printf("Execution failed: %v\n", err)
+			os.Exit(1)
+		}
+		windowGasUsed += nextGas
+	}
+
+	finalGasUsed := totalGas - vm.State.Gas
+	finalPath := filepath.Join(
+		outDir,
+		fmt.Sprintf("snapshot_%03d_final_step_%d_gas_%d.json", len(snapshotPaths), vm.State.StepCount, finalGasUsed),
+	)
+	finalSnap := core.NewStandardSnapshot(vm.State, vm.ChainID)
+	finalSnap.Meta = map[string]string{
+		"gas_used": fmt.Sprintf("%d", finalGasUsed),
+	}
+	if err := finalSnap.WriteFile(finalPath); err != nil {
+		fmt.Printf("Failed to write final snapshot: %v\n", err)
+		os.Exit(1)
+	}
+	snapshotPaths = append(snapshotPaths, finalPath)
+	index.AddSnapshot(filepath.Base(finalPath), finalSnap, finalGasUsed)
+
+	var recommendedProof string
+	var recommendedProofBytes uint64
+	if writeProofs {
+		for ordinal := 0; ordinal < len(index.Snapshots)-1; ordinal++ {
+			startSnap, err := core.ReadSnapshotFile(snapshotPaths[ordinal])
+			if err != nil {
+				fmt.Printf("Failed to read start snapshot: %v\n", err)
+				os.Exit(1)
+			}
+			endSnap, err := core.ReadSnapshotFile(snapshotPaths[ordinal+1])
+			if err != nil {
+				fmt.Printf("Failed to read end snapshot: %v\n", err)
+				os.Exit(1)
+			}
+			deltaSteps := endSnap.Header.StepNumber - startSnap.Header.StepNumber
+			segmentVM := core.NewVM(startSnap.State.Code, startSnap.State.Gas)
+			segmentVM.State = startSnap.State.Clone()
+			transitionProof, err := proof.GenerateTransitionProof(segmentVM, deltaSteps)
+			if err != nil {
+				fmt.Printf("Proof generation failed at ordinal %d: %v\n", ordinal, err)
+				os.Exit(1)
+			}
+			proofFile := fmt.Sprintf("proof_%03d_from_%d_steps_%d.json", ordinal+1, startSnap.Header.StepNumber, deltaSteps)
+			proofPath := filepath.Join(outDir, proofFile)
+			proofData, err := json.MarshalIndent(transitionProof, "", "  ")
+			if err != nil {
+				fmt.Printf("Proof marshal failed at ordinal %d: %v\n", ordinal, err)
+				os.Exit(1)
+			}
+			if len(proofData) > precompile.MaxProofBytes {
+				fmt.Printf(
+					"Proof %s is %d bytes, exceeding the %d byte verifier limit; lower -gas/-threshold or use -proofs=false\n",
+					proofFile,
+					len(proofData),
+					precompile.MaxProofBytes,
+				)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(proofPath, proofData, 0o644); err != nil {
+				fmt.Printf("Failed to write proof: %v\n", err)
+				os.Exit(1)
+			}
+			if err := index.SetAdjacentProof(ordinal, proofFile, deltaSteps, true); err != nil {
+				fmt.Printf("Failed to record proof metadata: %v\n", err)
+				os.Exit(1)
+			}
+			if ordinal == 0 {
+				recommendedProof = proofFile
+				recommendedProofBytes = uint64(len(proofData))
+			}
+		}
+	}
+
+	indexPath := filepath.Join(outDir, "snapshot_index.json")
+	if err := index.WriteFile(indexPath); err != nil {
+		fmt.Printf("Failed to write snapshot index: %v\n", err)
+		os.Exit(1)
+	}
+
+	nextSummary := ""
+	if len(index.Snapshots) > 1 {
+		next := index.Snapshots[1]
+		nextSummary = fmt.Sprintf(
+			"ordinal=%d step=%d gasUsed=%d gasRemaining=%d stateRoot=%s",
+			next.Ordinal,
+			next.StepNumber,
+			next.GasUsed,
+			next.GasRemaining,
+			next.StateRoot.Hex(),
+		)
+	}
+	manifest := artifactTaskManifest{
+		BytecodeHex:               codeHex,
+		CodeHash:                  crypto.Keccak256Hash(code).Hex(),
+		LoopIterations:            iterations,
+		TotalGas:                  totalGas,
+		SnapshotThresholdGas:      thresholdGas,
+		ChainID:                   chainID,
+		GasFormula:                "totalGas = 24 + 37 * iterations",
+		ArtifactKind:              "e2e",
+		ProofsGenerated:           writeProofs,
+		MaxSnapshotBytes:          precompile.MaxSnapshotBytes,
+		MaxProofBytes:             precompile.MaxProofBytes,
+		RecommendedFromOrdinal:    0,
+		RecommendedProofFile:      recommendedProof,
+		RecommendedProofBytes:     recommendedProofBytes,
+		RecommendedSnapshotFile:   filepath.Base(initialPath),
+		RecommendedNextCheckpoint: nextSummary,
+	}
+	manifestData, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		fmt.Printf("Failed to marshal manifest: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "task_manifest.json"), manifestData, 0o644); err != nil {
+		fmt.Printf("Failed to write manifest: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "task_bytecode.hex"), []byte(codeHex+"\n"), 0o644); err != nil {
+		fmt.Printf("Failed to write bytecode: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Artifacts written to %s\n", outDir)
+	fmt.Printf("Bytecode: %s\n", codeHex)
+	fmt.Printf("Code hash: %s\n", manifest.CodeHash)
+	fmt.Printf("Total gas: %d\n", totalGas)
+	fmt.Printf("Snapshot threshold gas: %d\n", thresholdGas)
+	fmt.Printf("Snapshots: %d\n", len(index.Snapshots))
+	if recommendedProof != "" {
+		fmt.Printf("Recommended proof: %s (%d bytes)\n", recommendedProof, recommendedProofBytes)
+	}
+	fmt.Printf("Recommended from ordinal: 0\n")
+	if nextSummary != "" {
+		fmt.Printf("Recommended next checkpoint: %s\n", nextSummary)
+	}
+}
+
+func countdownIterationsForGasFloor(gasFloor uint64) uint32 {
+	if gasFloor <= countdownSetupAndExitGas {
+		return 0
+	}
+
+	remaining := gasFloor - countdownSetupAndExitGas
+	iterations := remaining / countdownLoopGas
+	if remaining%countdownLoopGas != 0 {
+		iterations++
+	}
+	return uint32(iterations)
+}
+
+func countdownGasForIterations(iterations uint32) uint64 {
+	return countdownSetupAndExitGas + uint64(iterations)*countdownLoopGas
+}
+
+func buildCountdownLoop(iterations uint32) []byte {
+	code := []byte{
+		0x63, 0, 0, 0, 0,
+		0x5b,
+		0x80,
+		0x15,
+		0x60, 0x11,
+		0x57,
+		0x60, 0x01,
+		0x03,
+		0x60, 0x05,
+		0x56,
+		0x5b,
+		0x00,
+	}
+	binary.BigEndian.PutUint32(code[1:5], iterations)
+	return code
 }
 
 func parseHex(s string) []byte {
